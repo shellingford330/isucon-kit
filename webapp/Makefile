@@ -1,4 +1,4 @@
 all: app
 
 app: *.go go.mod go.sum
-	go build -o app
+	GOOS=linux GOARCH=amd64 go build -o app

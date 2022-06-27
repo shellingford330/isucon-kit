@@ -1,3 +1,7 @@
+SHELL=/bin/bash -e -o pipefail
+COLOR_GREEN=\u001b[32m
+COLOR_DEFAULT=\u001b[30m
+
 default: help
 
 ## This help screen
@@ -16,11 +20,28 @@ help:
 	{ lastLine = $$0 }' $(MAKEFILE_LIST) | sort -u
 	@printf "\n"
 
+## Restart server
+restart: app/restart mysql/restart nginx/restart mysql/rotate_log nginx/rotate_log
+	@printf "${COLOR_GREEN}Success!${COLOR_DEFAULT}\n"
+
+## [App] Restart server
+app/restart:
+	systemctl restart isu-go
+
+## [MySQL] Restart server
+mysql/restart:
+	systemctl restart mysql
+
 ## [MySQL] Rotate log file
 mysql/rotate_log:
 	rm /var/log/mysql/mysql-slow.log
 	# ファイルが更新されていることをMySQLに伝える
 	mysqladmin flush-logs
+
+## [Nginx] Restart server
+nginx/restart:
+	nginx -t
+	systemctl reload nginx
 
 ## [Nginx] Rotate log file
 nginx/rotate_log:

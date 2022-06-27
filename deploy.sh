@@ -3,7 +3,10 @@
 set -ue -o pipefail
 
 # Deploy source to remote 
-rsync -vr ./webapp/ isucon@54.199.244.193:~/private_isu/webapp/golang/
+rsync -vr ./webapp/ isucon:${APP_PATH}
+rsync -vr ./nginx/ isucon:${NGINX_CONF_PATH}
+rsync -vr ./mysql/ isucon:${MYSQL_CONF_PATH}
+rsync -vr ./Makefile isucon:~
 
 # Restart application server, middleware and so on ...
-make restart
+ssh isucon 'make restart'
