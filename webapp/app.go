@@ -567,22 +567,66 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC", t.Format(ISO8601Format))
+	query := "SELECT p.id AS `id`, p.user_id AS `user_id`, p.body AS `body`, p.mime AS `mime`, p.created_at AS `created_at`, " +
+		"u.id AS `user.id`, u.account_name AS `user.account_name`, u.passhash AS `user.passhash`, u.authority AS `user.authority`, u.del_flg AS `user.del_flg`, u.created_at AS `user.created_at` " +
+		"FROM `posts` p " +
+		"INNER JOIN `users` u ON u.id = p.user_id " +
+		"WHERE u.del_flg = 0 AND p.created_at <= ? " +
+		"ORDER BY p.created_at DESC " +
+		"LIMIT ?"
+	err = db.Select(&results, query, t.Format(ISO8601Format), postsPerPage)
 	if err != nil {
 		log.Print(err)
 		return
 	}
 
-	posts, err := makePosts(results, getCSRFToken(r), false)
-	if err != nil {
-		log.Print(err)
-		return
-	}
-
-	if len(posts) == 0 {
+	if len(results) == 0 {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
+
+	// start
+	csrfToken := getCSRFToken(r)
+
+	for i := range results {
+		err := db.Get(&results[i].CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", results[i].ID)
+		if err != nil {
+			log.Print(err)
+			return
+		}
+
+		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC LIMIT 3"
+		var comments []Comment
+		err = db.Select(&comments, query, results[i].ID)
+		if err != nil {
+			log.Print(err)
+			return
+		}
+
+		for i := 0; i < len(comments); i++ {
+			err := db.Get(&comments[i].User, "SELECT * FROM `users` WHERE `id` = ?", comments[i].UserID)
+			if err != nil {
+				log.Print(err)
+				return
+			}
+		}
+
+		// reverse
+		for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
+			comments[i], comments[j] = comments[j], comments[i]
+		}
+
+		results[i].Comments = comments
+
+		err = db.Get(&results[i].User, "SELECT * FROM `users` WHERE `id` = ?", results[i].UserID)
+		if err != nil {
+			log.Print(err)
+			return
+		}
+
+		results[i].CSRFToken = csrfToken
+	}
+	// end
 
 	fmap := template.FuncMap{
 		"imageURL": imageURL,
@@ -591,7 +635,7 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 	template.Must(template.New("posts.html").Funcs(fmap).ParseFiles(
 		getTemplPath("posts.html"),
 		getTemplPath("post.html"),
-	)).Execute(w, posts)
+	)).Execute(w, results)
 }
 
 func getPostsID(w http.ResponseWriter, r *http.Request) {
