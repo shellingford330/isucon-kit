@@ -3,6 +3,7 @@ COLOR_GREEN:=\u001b[32m
 COLOR_DEFAULT:=\u001b[30m
 
 MYSQL_SLOW_LOG_PATH:=/var/log/mysql/mysql-slow.log
+NGINX_ACCESS_LOG_PATH:=/var/log/nginx/access.log
 
 default: help
 
@@ -61,6 +62,18 @@ nginx/restart:
 ## [Nginx] Rotate log file
 nginx/rotate_log:
 	# 実行時点の日時を付与したファイル名にローテートする
-	mv /var/log/nginx/access.log /var/log/nginx/access.log.$(date +%Y%m%d-%H%M%S)
+	mv ${NGINX_ACCESS_LOG_PATH} ${NGINX_ACCESS_LOG_PATH}.$(date +%Y%m%d-%H%M%S)
 	# nginxにログファイルを開き直すシグナルを送信する
 	nginx -s reopen
+
+## [Nginx] Install alp
+nginx/install_alp:
+	apt install unzip
+	wget https://github.com/tkuchiki/alp/releases/download/v1.0.9/alp_linux_amd64.zip
+	unzip alp_linux_amd64.zip
+	sudo install ./alp /usr/local/bin
+
+## [Nginx] Run alp
+nginx/alp:
+	# パスパラメータの正規表現の例： -m "/posts/[0-9]+,/image/.*"
+	alp json --file ${NGINX_ACCESS_LOG_PATH} -r ${ARGS}
