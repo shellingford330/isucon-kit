@@ -183,7 +183,11 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 			return nil, err
 		}
 
-		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
+		query := "SELECT c.id AS `id`, c.post_id AS `post_id`, c.user_id AS `user_id`, c.comment AS `comment`, c.created_at AS `created_at`, " +
+			"u.id AS `user.id`, u.account_name AS `user.account_name`, u.passhash AS `user.passhash`, u.authority AS `user.authority`, u.del_flg AS `user.del_flg`, u.created_at AS `user.created_at` " +
+			"FROM `comments` c " +
+			"INNER JOIN `users` u ON u.id = c.user_id " +
+			"WHERE c.post_id = ? ORDER BY c.created_at DESC"
 		if !allComments {
 			query += " LIMIT 3"
 		}
@@ -191,13 +195,6 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 		err = db.Select(&comments, query, p.ID)
 		if err != nil {
 			return nil, err
-		}
-
-		for i := 0; i < len(comments); i++ {
-			err := db.Get(&comments[i].User, "SELECT * FROM `users` WHERE `id` = ?", comments[i].UserID)
-			if err != nil {
-				return nil, err
-			}
 		}
 
 		// reverse
@@ -412,20 +409,16 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC LIMIT 3"
+		query := "SELECT c.id AS `id`, c.post_id AS `post_id`, c.user_id AS `user_id`, c.comment AS `comment`, c.created_at AS `created_at`, " +
+			"u.id AS `user.id`, u.account_name AS `user.account_name`, u.passhash AS `user.passhash`, u.authority AS `user.authority`, u.del_flg AS `user.del_flg`, u.created_at AS `user.created_at` " +
+			"FROM `comments` c " +
+			"INNER JOIN `users` u ON u.id = c.user_id " +
+			"WHERE c.post_id = ? ORDER BY c.created_at DESC LIMIT 3"
 		var comments []Comment
 		err = db.Select(&comments, query, results[i].ID)
 		if err != nil {
 			log.Print(err)
 			return
-		}
-
-		for i := 0; i < len(comments); i++ {
-			err := db.Get(&comments[i].User, "SELECT * FROM `users` WHERE `id` = ?", comments[i].UserID)
-			if err != nil {
-				log.Print(err)
-				return
-			}
 		}
 
 		// reverse
@@ -434,12 +427,6 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 		}
 
 		results[i].Comments = comments
-
-		err = db.Get(&results[i].User, "SELECT * FROM `users` WHERE `id` = ?", results[i].UserID)
-		if err != nil {
-			log.Print(err)
-			return
-		}
 
 		results[i].CSRFToken = csrfToken
 	}
@@ -595,20 +582,16 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC LIMIT 3"
+		query := "SELECT c.id AS `id`, c.post_id AS `post_id`, c.user_id AS `user_id`, c.comment AS `comment`, c.created_at AS `created_at`, " +
+			"u.id AS `user.id`, u.account_name AS `user.account_name`, u.passhash AS `user.passhash`, u.authority AS `user.authority`, u.del_flg AS `user.del_flg`, u.created_at AS `user.created_at` " +
+			"FROM `comments` c " +
+			"INNER JOIN `users` u ON u.id = c.user_id " +
+			"WHERE c.post_id = ? ORDER BY c.created_at DESC LIMIT 3"
 		var comments []Comment
 		err = db.Select(&comments, query, results[i].ID)
 		if err != nil {
 			log.Print(err)
 			return
-		}
-
-		for i := 0; i < len(comments); i++ {
-			err := db.Get(&comments[i].User, "SELECT * FROM `users` WHERE `id` = ?", comments[i].UserID)
-			if err != nil {
-				log.Print(err)
-				return
-			}
 		}
 
 		// reverse
@@ -617,12 +600,6 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 		}
 
 		results[i].Comments = comments
-
-		err = db.Get(&results[i].User, "SELECT * FROM `users` WHERE `id` = ?", results[i].UserID)
-		if err != nil {
-			log.Print(err)
-			return
-		}
 
 		results[i].CSRFToken = csrfToken
 	}

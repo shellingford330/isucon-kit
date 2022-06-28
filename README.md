@@ -15,7 +15,7 @@ Host isucon
 2. 環境変数を`.envrc`にセットする
 
 ```
-export APP_PATH=~/private_isu/webapp/golang/
+export APP_PATH=/home/isucon/private_isu/webapp/golang/
 export NGINX_CONF_PATH=/etc/nginx/nginx.conf
 export MYSQL_CONF_PATH=/etc/mysql/conf.d/mysql.cnf
 ```
