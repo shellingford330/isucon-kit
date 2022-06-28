@@ -24,7 +24,7 @@ help:
 	@printf "\n"
 
 ## Restart server
-restart: app/restart mysql/restart nginx/restart mysql/rotate_log nginx/rotate_log
+restart: app/restart mysql/restart nginx/restart mysql/rotate-log nginx/rotate-log
 	@printf "${COLOR_GREEN}Success!${COLOR_DEFAULT}\n"
 
 ## [App] Restart server
@@ -36,18 +36,18 @@ mysql/restart:
 	systemctl restart mysql
 
 ## [MySQL] Rotate log file
-mysql/rotate_log:
+mysql/rotate-log:
 	rm ${MYSQL_SLOW_LOG_PATH}
 	# ファイルが更新されていることをMySQLに伝える
 	mysqladmin flush-logs
 
 ## [MySQL] Install pt-query-digest
-mysql/install_pt_query_digest:
+mysql/install-pt-query-digest:
 	apt-get update
 	apt-get install percona-toolkit
 
 ## [MySQL] Run pt-query-digest
-mysql/pt_query_digest:
+mysql/pt-query-digest:
 	pt-query-digest ${MYSQL_SLOW_LOG_PATH} | head -n 30
 
 ## [MySQL] Run mysqldumpslow
@@ -60,14 +60,14 @@ nginx/restart:
 	systemctl reload nginx
 
 ## [Nginx] Rotate log file
-nginx/rotate_log:
+nginx/rotate-log:
 	# 実行時点の日時を付与したファイル名にローテートする
 	mv ${NGINX_ACCESS_LOG_PATH} ${NGINX_ACCESS_LOG_PATH}.$(date +%Y%m%d-%H%M%S)
 	# nginxにログファイルを開き直すシグナルを送信する
 	nginx -s reopen
 
 ## [Nginx] Install alp
-nginx/install_alp:
+nginx/install-alp:
 	apt install unzip
 	wget https://github.com/tkuchiki/alp/releases/download/v1.0.9/alp_linux_amd64.zip
 	unzip alp_linux_amd64.zip
