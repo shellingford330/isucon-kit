@@ -1,6 +1,8 @@
-SHELL=/bin/bash -e -o pipefail
-COLOR_GREEN=\u001b[32m
-COLOR_DEFAULT=\u001b[30m
+SHELL:=/bin/bash -e -o pipefail
+COLOR_GREEN:=\u001b[32m
+COLOR_DEFAULT:=\u001b[30m
+
+MYSQL_SLOW_LOG_PATH:=/var/log/mysql/mysql-slow.log
 
 default: help
 
@@ -34,9 +36,22 @@ mysql/restart:
 
 ## [MySQL] Rotate log file
 mysql/rotate_log:
-	rm /var/log/mysql/mysql-slow.log
+	rm ${MYSQL_SLOW_LOG_PATH}
 	# ファイルが更新されていることをMySQLに伝える
 	mysqladmin flush-logs
+
+## [MySQL] Install pt-query-digest
+mysql/install_pt_query_digest:
+	apt-get update
+	apt-get install percona-toolkit
+
+## [MySQL] Run pt-query-digest
+mysql/pt_query_digest:
+	pt-query-digest ${MYSQL_SLOW_LOG_PATH} | head -n 30
+
+## [MySQL] Run mysqldumpslow
+mysql/mysqldumpslow:
+	mysqldumpslow ${MYSQL_SLOW_LOG_PATH}
 
 ## [Nginx] Restart server
 nginx/restart:
