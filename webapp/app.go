@@ -466,17 +466,51 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 
-	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC", user.ID)
+	query := "SELECT p.id AS `id`, p.user_id AS `user_id`, p.body AS `body`, p.mime AS `mime`, p.created_at AS `created_at`, " +
+		"u.id AS `user.id`, u.account_name AS `user.account_name`, u.passhash AS `user.passhash`, u.authority AS `user.authority`, u.del_flg AS `user.del_flg`, u.created_at AS `user.created_at` " +
+		"FROM `posts` p " +
+		"INNER JOIN `users` u ON u.id = p.user_id " +
+		"WHERE p.user_id = ? " +
+		"ORDER BY p.created_at DESC " +
+		"LIMIT ?"
+	err = db.Select(&results, query, user.ID, postsPerPage)
 	if err != nil {
 		log.Print(err)
 		return
 	}
 
-	posts, err := makePosts(results, getCSRFToken(r), false)
-	if err != nil {
-		log.Print(err)
-		return
+	// start
+	csrfToken := getCSRFToken(r)
+
+	for i := range results {
+		err := db.Get(&results[i].CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", results[i].ID)
+		if err != nil {
+			log.Print(err)
+			return
+		}
+
+		query := "SELECT c.id AS `id`, c.post_id AS `post_id`, c.user_id AS `user_id`, c.comment AS `comment`, c.created_at AS `created_at`, " +
+			"u.id AS `user.id`, u.account_name AS `user.account_name`, u.passhash AS `user.passhash`, u.authority AS `user.authority`, u.del_flg AS `user.del_flg`, u.created_at AS `user.created_at` " +
+			"FROM `comments` c " +
+			"INNER JOIN `users` u ON u.id = c.user_id " +
+			"WHERE c.post_id = ? ORDER BY c.created_at DESC LIMIT 3"
+		var comments []Comment
+		err = db.Select(&comments, query, results[i].ID)
+		if err != nil {
+			log.Print(err)
+			return
+		}
+
+		// reverse
+		for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
+			comments[i], comments[j] = comments[j], comments[i]
+		}
+
+		results[i].Comments = comments
+
+		results[i].CSRFToken = csrfToken
 	}
+	// end
 
 	commentCount := 0
 	err = db.Get(&commentCount, "SELECT COUNT(*) AS count FROM `comments` WHERE `user_id` = ?", user.ID)
@@ -532,7 +566,7 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 		CommentCount   int
 		CommentedCount int
 		Me             User
-	}{posts, user, postCount, commentCount, commentedCount, me})
+	}{results, user, postCount, commentCount, commentedCount, me})
 }
 
 func getPosts(w http.ResponseWriter, r *http.Request) {
