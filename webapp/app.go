@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -715,16 +716,19 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mime := ""
+	mime, ext := "", ""
 	if file != nil {
 		// 投稿のContent-Typeからファイルのタイプを決定する
 		contentType := header.Header["Content-Type"][0]
 		if strings.Contains(contentType, "jpeg") {
 			mime = "image/jpeg"
+			ext = "jpg"
 		} else if strings.Contains(contentType, "png") {
 			mime = "image/png"
+			ext = "png"
 		} else if strings.Contains(contentType, "gif") {
 			mime = "image/gif"
+			ext = "gif"
 		} else {
 			session := getSession(r)
 			session.Values["notice"] = "投稿できる画像形式はjpgとpngとgifだけです"
@@ -755,7 +759,7 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		query,
 		me.ID,
 		mime,
-		filedata,
+		"",
 		r.FormValue("body"),
 	)
 	if err != nil {
@@ -769,7 +773,14 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	http.Redirect(w, r, "/posts/"+strconv.FormatInt(pid, 10), http.StatusFound)
+	pidStr := strconv.FormatInt(pid, 10)
+	err = os.WriteFile(filepath.Join("..", "public", "image", getFilename(pidStr, ext)), filedata, os.ModePerm)
+	if err != nil {
+		log.Print(err)
+		return
+	}
+
+	http.Redirect(w, r, "/posts/"+pidStr, http.StatusFound)
 }
 
 func getImage(w http.ResponseWriter, r *http.Request) {
@@ -798,10 +809,20 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 			log.Print(err)
 			return
 		}
+
+		err = os.WriteFile(filepath.Join("..", "public", "image", getFilename(pidStr, ext)), post.Imgdata, os.ModePerm)
+		if err != nil {
+			log.Print(err)
+			return
+		}
 		return
 	}
 
 	w.WriteHeader(http.StatusNotFound)
+}
+
+func getFilename(id, ext string) string {
+	return id + "." + ext
 }
 
 func postComment(w http.ResponseWriter, r *http.Request) {
