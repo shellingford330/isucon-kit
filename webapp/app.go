@@ -34,6 +34,8 @@ var (
 	db      *sqlx.DB
 	store   *gsm.MemcacheStore
 	mycache *cache.Cache
+	// template
+	getLoginTpl, getRegisterTpl, getIndexTpl, getAccountNameTpl, getPostsTpl, getPostsIDTpl, getAdminBannedTpl *template.Template
 )
 
 const (
@@ -178,76 +180,6 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 	}
 }
 
-func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, error) {
-	var posts []Post
-
-	for _, p := range results {
-		var commentCount int
-		key := fmt.Sprintf("comment_count:post_id:%d", p.ID)
-		err := mycache.Get(context.Background(), key, &commentCount)
-		if err != nil && err != cache.ErrCacheMiss {
-			log.Print(err)
-			return nil, err
-		}
-		if err == cache.ErrCacheMiss {
-			err = db.Get(&commentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
-			if err != nil {
-				log.Print(err)
-				return nil, err
-			}
-
-			err = mycache.Set(&cache.Item{
-				Ctx:   context.Background(),
-				Key:   key,
-				Value: commentCount,
-				TTL:   10 * time.Second,
-			})
-			if err != nil {
-				log.Print(err)
-				return nil, err
-			}
-		}
-		p.CommentCount = commentCount
-
-		query := "SELECT c.id AS `id`, c.post_id AS `post_id`, c.user_id AS `user_id`, c.comment AS `comment`, c.created_at AS `created_at`, " +
-			"u.id AS `user.id`, u.account_name AS `user.account_name`, u.passhash AS `user.passhash`, u.authority AS `user.authority`, u.del_flg AS `user.del_flg`, u.created_at AS `user.created_at` " +
-			"FROM `comments` c " +
-			"INNER JOIN `users` u ON u.id = c.user_id " +
-			"WHERE c.post_id = ? ORDER BY c.created_at DESC"
-		if !allComments {
-			query += " LIMIT 3"
-		}
-		var comments []Comment
-		err = db.Select(&comments, query, p.ID)
-		if err != nil {
-			return nil, err
-		}
-
-		// reverse
-		for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
-			comments[i], comments[j] = comments[j], comments[i]
-		}
-
-		p.Comments = comments
-
-		err = db.Get(&p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
-		if err != nil {
-			return nil, err
-		}
-
-		p.CSRFToken = csrfToken
-
-		if p.User.DelFlg == 0 {
-			posts = append(posts, p)
-		}
-		if len(posts) >= postsPerPage {
-			break
-		}
-	}
-
-	return posts, nil
-}
-
 func imageURL(p Post) string {
 	ext := ""
 	if p.Mime == "image/jpeg" {
@@ -299,10 +231,7 @@ func getLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	template.Must(template.ParseFiles(
-		getTemplPath("layout.html"),
-		getTemplPath("login.html")),
-	).Execute(w, struct {
+	getLoginTpl.Execute(w, struct {
 		Me    User
 		Flash string
 	}{me, getFlash(w, r, "notice")})
@@ -338,10 +267,7 @@ func getRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	template.Must(template.ParseFiles(
-		getTemplPath("layout.html"),
-		getTemplPath("register.html")),
-	).Execute(w, struct {
+	getRegisterTpl.Execute(w, struct {
 		Me    User
 		Flash string
 	}{User{}, getFlash(w, r, "notice")})
@@ -497,16 +423,7 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 	}
 	// end
 
-	fmap := template.FuncMap{
-		"imageURL": imageURL,
-	}
-
-	template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
-		getTemplPath("layout.html"),
-		getTemplPath("index.html"),
-		getTemplPath("posts.html"),
-		getTemplPath("post.html"),
-	)).Execute(w, struct {
+	getIndexTpl.Execute(w, struct {
 		Posts     []Post
 		Me        User
 		CSRFToken string
@@ -531,14 +448,7 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 
-	query := "SELECT p.id AS `id`, p.user_id AS `user_id`, p.body AS `body`, p.mime AS `mime`, p.created_at AS `created_at`, " +
-		"u.id AS `user.id`, u.account_name AS `user.account_name`, u.passhash AS `user.passhash`, u.authority AS `user.authority`, u.del_flg AS `user.del_flg`, u.created_at AS `user.created_at` " +
-		"FROM `posts` p " +
-		"INNER JOIN `users` u ON u.id = p.user_id " +
-		"WHERE p.user_id = ? " +
-		"ORDER BY p.created_at DESC " +
-		"LIMIT ?"
-	err = db.Select(&results, query, user.ID, postsPerPage)
+	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC LIMIT ?", user.ID, postsPerPage)
 	if err != nil {
 		log.Print(err)
 		return
@@ -612,6 +522,8 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 		}
 		results[i].Comments = comments
 
+		results[i].User = user
+
 		results[i].CSRFToken = csrfToken
 	}
 	// end
@@ -654,16 +566,7 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 
 	me := getSessionUser(r)
 
-	fmap := template.FuncMap{
-		"imageURL": imageURL,
-	}
-
-	template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
-		getTemplPath("layout.html"),
-		getTemplPath("user.html"),
-		getTemplPath("posts.html"),
-		getTemplPath("post.html"),
-	)).Execute(w, struct {
+	getAccountNameTpl.Execute(w, struct {
 		Posts          []Post
 		User           User
 		PostCount      int
@@ -782,14 +685,7 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 	}
 	// end
 
-	fmap := template.FuncMap{
-		"imageURL": imageURL,
-	}
-
-	template.Must(template.New("posts.html").Funcs(fmap).ParseFiles(
-		getTemplPath("posts.html"),
-		getTemplPath("post.html"),
-	)).Execute(w, results)
+	getPostsTpl.Execute(w, results)
 }
 
 func getPostsID(w http.ResponseWriter, r *http.Request) {
@@ -887,15 +783,7 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 
 	me := getSessionUser(r)
 
-	fmap := template.FuncMap{
-		"imageURL": imageURL,
-	}
-
-	template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
-		getTemplPath("layout.html"),
-		getTemplPath("post_id.html"),
-		getTemplPath("post.html"),
-	)).Execute(w, struct {
+	getPostsIDTpl.Execute(w, struct {
 		Post Post
 		Me   User
 	}{p, me})
@@ -1079,10 +967,7 @@ func getAdminBanned(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	template.Must(template.ParseFiles(
-		getTemplPath("layout.html"),
-		getTemplPath("banned.html")),
-	).Execute(w, struct {
+	getAdminBannedTpl.Execute(w, struct {
 		Users     []User
 		Me        User
 		CSRFToken string
@@ -1184,6 +1069,7 @@ func main() {
 	}
 	defer db.Close()
 
+	// redis
 	ring := redis.NewRing(&redis.RingOptions{
 		Addrs: map[string]string{
 			"server1": ":6379",
@@ -1192,6 +1078,44 @@ func main() {
 	mycache = cache.New(&cache.Options{
 		Redis: ring,
 	})
+
+	// template
+	fmap := template.FuncMap{
+		"imageURL": imageURL,
+	}
+	getLoginTpl = template.Must(template.ParseFiles(
+		getTemplPath("layout.html"),
+		getTemplPath("login.html")),
+	)
+	getRegisterTpl = template.Must(template.ParseFiles(
+		getTemplPath("layout.html"),
+		getTemplPath("register.html")),
+	)
+	getIndexTpl = template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
+		getTemplPath("layout.html"),
+		getTemplPath("index.html"),
+		getTemplPath("posts.html"),
+		getTemplPath("post.html"),
+	))
+	getAccountNameTpl = template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
+		getTemplPath("layout.html"),
+		getTemplPath("user.html"),
+		getTemplPath("posts.html"),
+		getTemplPath("post.html"),
+	))
+	getPostsTpl = template.Must(template.New("posts.html").Funcs(fmap).ParseFiles(
+		getTemplPath("posts.html"),
+		getTemplPath("post.html"),
+	))
+	getPostsIDTpl = template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
+		getTemplPath("layout.html"),
+		getTemplPath("post_id.html"),
+		getTemplPath("post.html"),
+	))
+	getAdminBannedTpl = template.Must(template.ParseFiles(
+		getTemplPath("layout.html"),
+		getTemplPath("banned.html")),
+	)
 
 	mux := goji.NewMux()
 
