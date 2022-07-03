@@ -77,3 +77,8 @@ nginx/install-alp:
 nginx/alp:
 	# パスパラメータの正規表現の例： -m "/posts/[0-9]+,/image/.*"
 	alp json --file ${NGINX_ACCESS_LOG_PATH} -r ${ARGS}
+
+## [Redis] Install Redis
+redis/install:
+	apt-get update
+	apt-get install redis

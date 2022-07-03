@@ -20,6 +20,8 @@ import (
 
 	"github.com/bradfitz/gomemcache/memcache"
 	gsm "github.com/bradleypeabody/gorilla-sessions-memcache"
+	cache "github.com/go-redis/cache/v8"
+	redis "github.com/go-redis/redis/v8"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/gorilla/sessions"
 	"github.com/jmoiron/sqlx"
@@ -29,8 +31,9 @@ import (
 )
 
 var (
-	db    *sqlx.DB
-	store *gsm.MemcacheStore
+	db      *sqlx.DB
+	store   *gsm.MemcacheStore
+	mycache *cache.Cache
 )
 
 const (
@@ -179,10 +182,32 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 	var posts []Post
 
 	for _, p := range results {
-		err := db.Get(&p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
-		if err != nil {
+		var commentCount int
+		key := fmt.Sprintf("comment_count:post_id:%d", p.ID)
+		err := mycache.Get(context.Background(), key, &commentCount)
+		if err != nil && err != cache.ErrCacheMiss {
+			log.Print(err)
 			return nil, err
 		}
+		if err == cache.ErrCacheMiss {
+			err = db.Get(&commentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
+			if err != nil {
+				log.Print(err)
+				return nil, err
+			}
+
+			err = mycache.Set(&cache.Item{
+				Ctx:   context.Background(),
+				Key:   key,
+				Value: p.CommentCount,
+				TTL:   10 * time.Second,
+			})
+			if err != nil {
+				log.Print(err)
+				return nil, err
+			}
+		}
+		p.CommentCount = commentCount
 
 		query := "SELECT c.id AS `id`, c.post_id AS `post_id`, c.user_id AS `user_id`, c.comment AS `comment`, c.created_at AS `created_at`, " +
 			"u.id AS `user.id`, u.account_name AS `user.account_name`, u.passhash AS `user.passhash`, u.authority AS `user.authority`, u.del_flg AS `user.del_flg`, u.created_at AS `user.created_at` " +
@@ -404,11 +429,32 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 	csrfToken := getCSRFToken(r)
 
 	for i := range results {
-		err := db.Get(&results[i].CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", results[i].ID)
-		if err != nil {
+		var commentCount int
+		key := fmt.Sprintf("comment_count:post_id:%d", results[i].ID)
+		err := mycache.Get(context.Background(), key, &commentCount)
+		if err != nil && err != cache.ErrCacheMiss {
 			log.Print(err)
 			return
 		}
+		if err == cache.ErrCacheMiss {
+			err = db.Get(&commentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", results[i].ID)
+			if err != nil {
+				log.Print(err)
+				return
+			}
+
+			err = mycache.Set(&cache.Item{
+				Ctx:   context.Background(),
+				Key:   key,
+				Value: results[i].CommentCount,
+				TTL:   10 * time.Second,
+			})
+			if err != nil {
+				log.Print(err)
+				return
+			}
+		}
+		results[i].CommentCount = commentCount
 
 		query := "SELECT c.id AS `id`, c.post_id AS `post_id`, c.user_id AS `user_id`, c.comment AS `comment`, c.created_at AS `created_at`, " +
 			"u.id AS `user.id`, u.account_name AS `user.account_name`, u.passhash AS `user.passhash`, u.authority AS `user.authority`, u.del_flg AS `user.del_flg`, u.created_at AS `user.created_at` " +
@@ -484,11 +530,32 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 	csrfToken := getCSRFToken(r)
 
 	for i := range results {
-		err := db.Get(&results[i].CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", results[i].ID)
-		if err != nil {
+		var commentCount int
+		key := fmt.Sprintf("comment_count:post_id:%d", results[i].ID)
+		err := mycache.Get(context.Background(), key, &commentCount)
+		if err != nil && err != cache.ErrCacheMiss {
 			log.Print(err)
 			return
 		}
+		if err == cache.ErrCacheMiss {
+			err = db.Get(&commentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", results[i].ID)
+			if err != nil {
+				log.Print(err)
+				return
+			}
+
+			err = mycache.Set(&cache.Item{
+				Ctx:   context.Background(),
+				Key:   key,
+				Value: results[i].CommentCount,
+				TTL:   10 * time.Second,
+			})
+			if err != nil {
+				log.Print(err)
+				return
+			}
+		}
+		results[i].CommentCount = commentCount
 
 		query := "SELECT c.id AS `id`, c.post_id AS `post_id`, c.user_id AS `user_id`, c.comment AS `comment`, c.created_at AS `created_at`, " +
 			"u.id AS `user.id`, u.account_name AS `user.account_name`, u.passhash AS `user.passhash`, u.authority AS `user.authority`, u.del_flg AS `user.del_flg`, u.created_at AS `user.created_at` " +
@@ -611,11 +678,32 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 	csrfToken := getCSRFToken(r)
 
 	for i := range results {
-		err := db.Get(&results[i].CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", results[i].ID)
-		if err != nil {
+		var commentCount int
+		key := fmt.Sprintf("comment_count:post_id:%d", results[i].ID)
+		err := mycache.Get(context.Background(), key, &commentCount)
+		if err != nil && err != cache.ErrCacheMiss {
 			log.Print(err)
 			return
 		}
+		if err == cache.ErrCacheMiss {
+			err = db.Get(&commentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", results[i].ID)
+			if err != nil {
+				log.Print(err)
+				return
+			}
+
+			err = mycache.Set(&cache.Item{
+				Ctx:   context.Background(),
+				Key:   key,
+				Value: results[i].CommentCount,
+				TTL:   10 * time.Second,
+			})
+			if err != nil {
+				log.Print(err)
+				return
+			}
+		}
+		results[i].CommentCount = commentCount
 
 		query := "SELECT c.id AS `id`, c.post_id AS `post_id`, c.user_id AS `user_id`, c.comment AS `comment`, c.created_at AS `created_at`, " +
 			"u.id AS `user.id`, u.account_name AS `user.account_name`, u.passhash AS `user.passhash`, u.authority AS `user.authority`, u.del_flg AS `user.del_flg`, u.created_at AS `user.created_at` " +
@@ -976,6 +1064,15 @@ func main() {
 		log.Fatalf("Failed to connect to DB: %s.", err.Error())
 	}
 	defer db.Close()
+
+	ring := redis.NewRing(&redis.RingOptions{
+		Addrs: map[string]string{
+			"server1": ":6379",
+		},
+	})
+	mycache = cache.New(&cache.Options{
+		Redis: ring,
+	})
 
 	mux := goji.NewMux()
 
