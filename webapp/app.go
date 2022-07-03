@@ -199,7 +199,7 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 			err = mycache.Set(&cache.Item{
 				Ctx:   context.Background(),
 				Key:   key,
-				Value: p.CommentCount,
+				Value: commentCount,
 				TTL:   10 * time.Second,
 			})
 			if err != nil {
@@ -446,7 +446,7 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 			err = mycache.Set(&cache.Item{
 				Ctx:   context.Background(),
 				Key:   key,
-				Value: results[i].CommentCount,
+				Value: commentCount,
 				TTL:   10 * time.Second,
 			})
 			if err != nil {
@@ -456,23 +456,41 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 		}
 		results[i].CommentCount = commentCount
 
-		query := "SELECT c.id AS `id`, c.post_id AS `post_id`, c.user_id AS `user_id`, c.comment AS `comment`, c.created_at AS `created_at`, " +
-			"u.id AS `user.id`, u.account_name AS `user.account_name`, u.passhash AS `user.passhash`, u.authority AS `user.authority`, u.del_flg AS `user.del_flg`, u.created_at AS `user.created_at` " +
-			"FROM `comments` c " +
-			"INNER JOIN `users` u ON u.id = c.user_id " +
-			"WHERE c.post_id = ? ORDER BY c.created_at DESC LIMIT 3"
 		var comments []Comment
-		err = db.Select(&comments, query, results[i].ID)
-		if err != nil {
+		key = fmt.Sprintf("comments:post_id:%d", results[i].ID)
+		err = mycache.Get(context.Background(), key, &comments)
+		if err != nil && err != cache.ErrCacheMiss {
 			log.Print(err)
 			return
 		}
+		if err == cache.ErrCacheMiss {
+			query := "SELECT c.id AS `id`, c.post_id AS `post_id`, c.user_id AS `user_id`, c.comment AS `comment`, c.created_at AS `created_at`, " +
+				"u.id AS `user.id`, u.account_name AS `user.account_name`, u.passhash AS `user.passhash`, u.authority AS `user.authority`, u.del_flg AS `user.del_flg`, u.created_at AS `user.created_at` " +
+				"FROM `comments` c " +
+				"INNER JOIN `users` u ON u.id = c.user_id " +
+				"WHERE c.post_id = ? ORDER BY c.created_at DESC LIMIT 3"
+			err = db.Select(&comments, query, results[i].ID)
+			if err != nil {
+				log.Print(err)
+				return
+			}
 
-		// reverse
-		for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
-			comments[i], comments[j] = comments[j], comments[i]
+			// reverse
+			for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
+				comments[i], comments[j] = comments[j], comments[i]
+			}
+
+			err = mycache.Set(&cache.Item{
+				Ctx:   context.Background(),
+				Key:   key,
+				Value: comments,
+				TTL:   10 * time.Second,
+			})
+			if err != nil {
+				log.Print(err)
+				return
+			}
 		}
-
 		results[i].Comments = comments
 
 		results[i].CSRFToken = csrfToken
@@ -547,7 +565,7 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 			err = mycache.Set(&cache.Item{
 				Ctx:   context.Background(),
 				Key:   key,
-				Value: results[i].CommentCount,
+				Value: commentCount,
 				TTL:   10 * time.Second,
 			})
 			if err != nil {
@@ -557,23 +575,41 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 		}
 		results[i].CommentCount = commentCount
 
-		query := "SELECT c.id AS `id`, c.post_id AS `post_id`, c.user_id AS `user_id`, c.comment AS `comment`, c.created_at AS `created_at`, " +
-			"u.id AS `user.id`, u.account_name AS `user.account_name`, u.passhash AS `user.passhash`, u.authority AS `user.authority`, u.del_flg AS `user.del_flg`, u.created_at AS `user.created_at` " +
-			"FROM `comments` c " +
-			"INNER JOIN `users` u ON u.id = c.user_id " +
-			"WHERE c.post_id = ? ORDER BY c.created_at DESC LIMIT 3"
 		var comments []Comment
-		err = db.Select(&comments, query, results[i].ID)
-		if err != nil {
+		key = fmt.Sprintf("comments:post_id:%d", results[i].ID)
+		err = mycache.Get(context.Background(), key, &comments)
+		if err != nil && err != cache.ErrCacheMiss {
 			log.Print(err)
 			return
 		}
+		if err == cache.ErrCacheMiss {
+			query := "SELECT c.id AS `id`, c.post_id AS `post_id`, c.user_id AS `user_id`, c.comment AS `comment`, c.created_at AS `created_at`, " +
+				"u.id AS `user.id`, u.account_name AS `user.account_name`, u.passhash AS `user.passhash`, u.authority AS `user.authority`, u.del_flg AS `user.del_flg`, u.created_at AS `user.created_at` " +
+				"FROM `comments` c " +
+				"INNER JOIN `users` u ON u.id = c.user_id " +
+				"WHERE c.post_id = ? ORDER BY c.created_at DESC LIMIT 3"
+			err = db.Select(&comments, query, results[i].ID)
+			if err != nil {
+				log.Print(err)
+				return
+			}
 
-		// reverse
-		for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
-			comments[i], comments[j] = comments[j], comments[i]
+			// reverse
+			for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
+				comments[i], comments[j] = comments[j], comments[i]
+			}
+
+			err = mycache.Set(&cache.Item{
+				Ctx:   context.Background(),
+				Key:   key,
+				Value: comments,
+				TTL:   10 * time.Second,
+			})
+			if err != nil {
+				log.Print(err)
+				return
+			}
 		}
-
 		results[i].Comments = comments
 
 		results[i].CSRFToken = csrfToken
@@ -695,7 +731,7 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 			err = mycache.Set(&cache.Item{
 				Ctx:   context.Background(),
 				Key:   key,
-				Value: results[i].CommentCount,
+				Value: commentCount,
 				TTL:   10 * time.Second,
 			})
 			if err != nil {
@@ -705,23 +741,41 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 		}
 		results[i].CommentCount = commentCount
 
-		query := "SELECT c.id AS `id`, c.post_id AS `post_id`, c.user_id AS `user_id`, c.comment AS `comment`, c.created_at AS `created_at`, " +
-			"u.id AS `user.id`, u.account_name AS `user.account_name`, u.passhash AS `user.passhash`, u.authority AS `user.authority`, u.del_flg AS `user.del_flg`, u.created_at AS `user.created_at` " +
-			"FROM `comments` c " +
-			"INNER JOIN `users` u ON u.id = c.user_id " +
-			"WHERE c.post_id = ? ORDER BY c.created_at DESC LIMIT 3"
 		var comments []Comment
-		err = db.Select(&comments, query, results[i].ID)
-		if err != nil {
+		key = fmt.Sprintf("comments:post_id:%d", results[i].ID)
+		err = mycache.Get(context.Background(), key, &comments)
+		if err != nil && err != cache.ErrCacheMiss {
 			log.Print(err)
 			return
 		}
+		if err == cache.ErrCacheMiss {
+			query := "SELECT c.id AS `id`, c.post_id AS `post_id`, c.user_id AS `user_id`, c.comment AS `comment`, c.created_at AS `created_at`, " +
+				"u.id AS `user.id`, u.account_name AS `user.account_name`, u.passhash AS `user.passhash`, u.authority AS `user.authority`, u.del_flg AS `user.del_flg`, u.created_at AS `user.created_at` " +
+				"FROM `comments` c " +
+				"INNER JOIN `users` u ON u.id = c.user_id " +
+				"WHERE c.post_id = ? ORDER BY c.created_at DESC LIMIT 3"
+			err = db.Select(&comments, query, results[i].ID)
+			if err != nil {
+				log.Print(err)
+				return
+			}
 
-		// reverse
-		for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
-			comments[i], comments[j] = comments[j], comments[i]
+			// reverse
+			for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
+				comments[i], comments[j] = comments[j], comments[i]
+			}
+
+			err = mycache.Set(&cache.Item{
+				Ctx:   context.Background(),
+				Key:   key,
+				Value: comments,
+				TTL:   10 * time.Second,
+			})
+			if err != nil {
+				log.Print(err)
+				return
+			}
 		}
-
 		results[i].Comments = comments
 
 		results[i].CSRFToken = csrfToken
@@ -747,24 +801,89 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-	err = db.Select(&results, "SELECT id, user_id, body, mime, created_at FROM `posts` WHERE `id` = ?", pid)
+
+	query := "SELECT p.id AS `id`, p.user_id AS `user_id`, p.body AS `body`, p.mime AS `mime`, p.created_at AS `created_at`, " +
+		"u.id AS `user.id`, u.account_name AS `user.account_name`, u.passhash AS `user.passhash`, u.authority AS `user.authority`, u.del_flg AS `user.del_flg`, u.created_at AS `user.created_at` " +
+		"FROM `posts` p " +
+		"INNER JOIN `users` u ON u.id = p.user_id " +
+		"WHERE u.del_flg = 0 AND p.id = ?"
+	err = db.Select(&results, query, pid)
 	if err != nil {
 		log.Print(err)
 		return
 	}
 
-	posts, err := makePosts(results, getCSRFToken(r), true)
-	if err != nil {
-		log.Print(err)
-		return
-	}
-
-	if len(posts) == 0 {
+	if len(results) == 0 {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 
-	p := posts[0]
+	p := results[0]
+
+	var commentCount int
+	key := fmt.Sprintf("comment_count:post_id:%d", pid)
+	err = mycache.Get(context.Background(), key, &commentCount)
+	if err != nil && err != cache.ErrCacheMiss {
+		log.Print(err)
+		return
+	}
+	if err == cache.ErrCacheMiss {
+		err = db.Get(&commentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
+		if err != nil {
+			log.Print(err)
+			return
+		}
+
+		err = mycache.Set(&cache.Item{
+			Ctx:   context.Background(),
+			Key:   key,
+			Value: commentCount,
+			TTL:   10 * time.Second,
+		})
+		if err != nil {
+			log.Print(err)
+			return
+		}
+	}
+	p.CommentCount = commentCount
+
+	var comments []Comment
+	key = fmt.Sprintf("comments:post_id:%d", p.ID)
+	err = mycache.Get(context.Background(), key, &comments)
+	if err != nil && err != cache.ErrCacheMiss {
+		log.Print(err)
+		return
+	}
+	if err == cache.ErrCacheMiss {
+		query := "SELECT c.id AS `id`, c.post_id AS `post_id`, c.user_id AS `user_id`, c.comment AS `comment`, c.created_at AS `created_at`, " +
+			"u.id AS `user.id`, u.account_name AS `user.account_name`, u.passhash AS `user.passhash`, u.authority AS `user.authority`, u.del_flg AS `user.del_flg`, u.created_at AS `user.created_at` " +
+			"FROM `comments` c " +
+			"INNER JOIN `users` u ON u.id = c.user_id " +
+			"WHERE c.post_id = ? ORDER BY c.created_at DESC LIMIT 3"
+		err = db.Select(&comments, query, p.ID)
+		if err != nil {
+			log.Print(err)
+			return
+		}
+
+		// reverse
+		for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
+			comments[i], comments[j] = comments[j], comments[i]
+		}
+
+		err = mycache.Set(&cache.Item{
+			Ctx:   context.Background(),
+			Key:   key,
+			Value: comments,
+			TTL:   10 * time.Second,
+		})
+		if err != nil {
+			log.Print(err)
+			return
+		}
+	}
+
+	p.CSRFToken = getCSRFToken(r)
 
 	me := getSessionUser(r)
 
