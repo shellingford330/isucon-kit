@@ -6,7 +6,7 @@
 
 ## Setup
 
-### 0. Login As Root User On Remote Host
+### 1. Login As Root User On Remote Host
 
 `root`ユーザとしてログインできるようにする。
 
@@ -22,7 +22,7 @@ $ ssh isucon@{リモートホストIP}
 $ sudo cp ~/.ssh/authorized_keys /root/.ssh/authorized_keys
 ```
 
-### 1. Configure Remote Host
+### 2. Configure Remote Host
 
 `~/.ssh/config`にホスト`isucon`としてリモートホスト情報（root ユーザ）を登録。
 
@@ -34,7 +34,7 @@ Host isucon
   IdentityFile ~/.ssh/id_ed25519
 ```
 
-### 2. Pull Remote Files
+### 3. Pull Remote Files
 
 リモートホストのアプリケーション、Nginx, MySQL 設定ファイルをプルしてくるセットアップシェルスクリプトを実行。
 
