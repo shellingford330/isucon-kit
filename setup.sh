@@ -11,6 +11,6 @@ then
 fi
 
 # Pull application code & nginx, mysql config file
-rsync -av isucon:${APP_PATH} ./webapp/
+rsync --filter=":- .gitignore" -av isucon:${APP_PATH} ./webapp/
 rsync -av isucon:${NGINX_CONF_PATH} ./nginx/
 rsync -av isucon:${MYSQL_CONF_PATH} ./mysql/
