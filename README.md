@@ -4,7 +4,6 @@
 
 - ssh
 - rsync
-- direnv
 
 ## Setup
 

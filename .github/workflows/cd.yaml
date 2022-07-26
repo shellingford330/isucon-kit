@@ -19,5 +19,5 @@ jobs:
               Port 22
               StrictHostKeyChecking no
               IdentityFile ~/.ssh/id_rsa
-      - name: SSH Test
-        run: ssh -T isucon
+      - name: Deploy
+        run: sh deploy.sh
