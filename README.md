@@ -6,6 +6,8 @@
 - rsync
 - direnv
 
+## Setup
+
 ### 1. Configure Remote Host
 
 `~/.ssh/config`にホスト`isucon`としてリモートホスト情報を登録。
@@ -13,7 +15,7 @@
 ```
 Host isucon
   Hostname <ホストIP>
-  User <ログインするユーザ>
+  User isucon
   Port 22
   IdentityFile ~/.ssh/id_ed25519
 ```
@@ -23,9 +25,9 @@ Host isucon
 `.envrc`ファイルに環境変数をセットする。
 
 ```
-export APP_PATH=/home/isucon/private_isu/webapp/golang/
-export NGINX_CONF_PATH=/etc/nginx/nginx.conf
-export MYSQL_CONF_PATH=/etc/mysql/conf.d/mysql.cnf
+export APP_PATH=/home/isucon/webapp/
+export NGINX_CONF_PATH=/etc/nginx/
+export MYSQL_CONF_PATH=/etc/mysql/
 ```
 
 ### 3. Pull Remote Files
@@ -34,26 +36,4 @@ export MYSQL_CONF_PATH=/etc/mysql/conf.d/mysql.cnf
 
 ```sh
 $ sh ./setup.sh
-```
-
-## Deploy
-
-リモートホストにデプロイする。
-
-```sh
-$ sh ./deploy.sh
-```
-
-## Analyze Access Log
-
-```sh
-% make nginx/install-alp
-% make nginx/alp
-```
-
-## Analyze Slow Query Log
-
-```sh
-% make mysql/install-pt-query-digest
-% make mysql/pt-query-digest
 ```
