@@ -29,22 +29,22 @@ restart: app/restart mysql/restart nginx/restart mysql/rotate-log nginx/rotate-l
 
 ## [App] Restart server
 app/restart:
-	systemctl restart isu-go
+	sudo systemctl restart isu-go
 
 ## [MySQL] Restart server
 mysql/restart:
-	systemctl restart mysql
+	sudo systemctl restart mysql
 
 ## [MySQL] Rotate log file
 mysql/rotate-log:
-	rm ${MYSQL_SLOW_LOG_PATH}
+	-sudo rm ${MYSQL_SLOW_LOG_PATH}
 	# ファイルが更新されていることをMySQLに伝える
-	mysqladmin flush-logs
+	sudo mysqladmin flush-logs
 
 ## [MySQL] Install pt-query-digest
 mysql/install-pt-query-digest:
-	apt-get update
-	apt-get install percona-toolkit
+	sudo apt-get update
+	sudo apt-get install -y percona-toolkit
 
 ## [MySQL] Run pt-query-digest
 mysql/pt-query-digest:
@@ -56,19 +56,19 @@ mysql/mysqldumpslow:
 
 ## [Nginx] Restart server
 nginx/restart:
-	nginx -t
-	systemctl reload nginx
+	sudo nginx -t
+	sudo systemctl reload nginx
 
 ## [Nginx] Rotate log file
 nginx/rotate-log:
 	# 実行時点の日時を付与したファイル名にローテートする
-	mv ${NGINX_ACCESS_LOG_PATH} ${NGINX_ACCESS_LOG_PATH}.$(date +%Y%m%d-%H%M%S)
+	-sudo mv ${NGINX_ACCESS_LOG_PATH} ${NGINX_ACCESS_LOG_PATH}.$(date +%Y%m%d-%H%M%S)
 	# nginxにログファイルを開き直すシグナルを送信する
-	nginx -s reopen
+	sudo nginx -s reopen
 
 ## [Nginx] Install alp
 nginx/install-alp:
-	apt install unzip
+	sudo apt install -y unzip
 	wget https://github.com/tkuchiki/alp/releases/download/v1.0.9/alp_linux_amd64.zip
 	unzip alp_linux_amd64.zip
 	sudo install ./alp /usr/local/bin
@@ -80,5 +80,5 @@ nginx/alp:
 
 ## [Redis] Install Redis
 redis/install:
-	apt-get update
-	apt-get install redis
+	sudo apt-get update
+	sudo apt-get install -y redis

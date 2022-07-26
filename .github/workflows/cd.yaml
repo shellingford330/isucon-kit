@@ -1,0 +1,23 @@
+name: CD
+on: push
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install SSH key
+        uses: shimataro/ssh-key-action@v2
+        with:
+          key: ${{ secrets.SSH_KEY }}
+          name: id_rsa
+          known_hosts: unnecessary
+          config: |
+            Host isucon
+              HostName 35.77.214.139
+              User isucon
+              Port 22
+              StrictHostKeyChecking no
+              IdentityFile ~/.ssh/id_rsa
+      - name: SSH Test
+        run: ssh -T isucon

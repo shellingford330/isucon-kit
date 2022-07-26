@@ -10,11 +10,7 @@ then
   exit 0
 fi
 
-# Pull application code
-rsync -vr isucon:${APP_PATH} ./webapp/
-
-# Pull Nginx configuration file
-rsync -vr isucon:${NGINX_CONF_PATH} ./nginx/
-
-# Pull MySQL configuration file
-rsync -vr isucon:${MYSQL_CONF_PATH} ./mysql/
+# Pull application code & nginx, mysql config file
+rsync -av isucon:${APP_PATH} ./webapp/
+rsync -av isucon:${NGINX_CONF_PATH} ./nginx/
+rsync -av isucon:${MYSQL_CONF_PATH} ./mysql/
