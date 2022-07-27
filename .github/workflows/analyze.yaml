@@ -25,11 +25,11 @@ jobs:
       - name: Pull slow query log
         run: echo "Analyze slow query log" > results.txt
       - name: Comment PR
-        uses: shellingford330/pr-comment-action@master
+        uses: shellingford330/pr-comment-action@v0.0.1
         with:
           owner: ${{ github.event.repository.owner.login }}
           repo: ${{ github.event.repository.number }}
           number: ${{ github.event.issue.number }}
-          filepath: .
+          filepath: ./
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
