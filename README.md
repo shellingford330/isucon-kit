@@ -6,7 +6,7 @@
 
 ## Setup
 
-### 1. Login As Root User On Remote Host
+### 1. Login as Root User on Remote Host
 
 `root`ユーザとしてログインできるようにする。
 
