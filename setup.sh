@@ -14,3 +14,6 @@ fi
 rsync --filter=":- .gitignore" -av isucon:/home/isucon/webapp/ ./webapp/
 rsync -av isucon:/etc/nginx/ ./nginx/
 rsync -av isucon:/etc/mysql/ ./mysql/
+
+# Install analyzer log tool 
+ssh isucon 'make install'
