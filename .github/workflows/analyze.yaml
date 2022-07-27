@@ -24,9 +24,12 @@ jobs:
               IdentityFile ~/.ssh/id_rsa
       - name: Pull slow query log
         run: echo "Analyze slow query log" > results.txt
-      - name: Comment to PR
-        uses: machine-learning-apps/pr-comment@master
+      - name: Comment PR
+        uses: shellingford330/pr-comment-action@master
+        with:
+          owner: ${{ github.event.repository.owner.login }}
+          repo: ${{ github.event.repository.number }}
+          number: ${{ github.event.issue.number }}
+          filepath: .
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          path: results.txt
