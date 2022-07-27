@@ -1,10 +1,9 @@
 name: Analyze
-on:
-  issue_comment:
-    types: [created]
+on: issue_comment
 
 jobs:
   slow-query-log:
+    if: ${{ github.event.issue.pull_request }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
@@ -22,10 +21,10 @@ jobs:
               StrictHostKeyChecking no
               IdentityFile ~/.ssh/id_rsa
       - name: Pull slow query log
-        run: echo "Deploy Successful!" > output/results.txt
+        run: echo "Analyze slow query log" > results.txt
       - name: Comment to PR
         uses: machine-learning-apps/pr-comment@master
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          path: output/results.txt
+          path: results.txt
