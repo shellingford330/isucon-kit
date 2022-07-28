@@ -30,6 +30,6 @@ jobs:
           owner: ${{ github.event.repository.owner.login }}
           repo: ${{ github.event.repository.name }}
           pr_number: ${{ github.event.issue.number }}
-          filepath: ./test
+          filepath: ./
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
