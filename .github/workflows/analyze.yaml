@@ -7,6 +7,7 @@ jobs:
   slow-query-log:
     if: ${{ github.event.issue.pull_request }}
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v3
       - name: Install SSH key
@@ -22,15 +23,15 @@ jobs:
               Port 22
               StrictHostKeyChecking no
               IdentityFile ~/.ssh/id_rsa
-      - name: Pull slow query log
-        run: echo "Analyze slow query log" > results.txt
+      - name: Create output file
+        run: echo "Create PR comment successfully!" > output.txt
       - name: Comment PR
-        uses: shellingford330/pr-comment-action@v0.0.3
+        uses: shellingford330/pr-comment-action@v0.0.4
         with:
           owner: ${{ github.event.repository.owner.login }}
           repo: ${{ github.event.repository.name }}
           pr_number: ${{ github.event.issue.number }}
-          filepath: results.txt
+          filepath: output.txt
           template: |
             <details>
             <summary>Show Output</summary>
