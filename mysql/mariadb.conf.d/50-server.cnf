@@ -125,6 +125,9 @@ slow_query_log_file=/var/log/mysql/mysql-slow.log
 long_query_time=0
 log_queries_not_using_indexes=1
 
+innodb_flush_log_at_trx_commit=2
+disable-log-bin
+
 
 # this is only for embedded server
 [embedded]
