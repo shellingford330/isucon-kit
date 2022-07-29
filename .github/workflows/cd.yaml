@@ -14,7 +14,7 @@ jobs:
           known_hosts: unnecessary
           config: |
             Host isucon
-              HostName 35.77.214.139
+              HostName 35.78.206.73
               User root
               Port 22
               StrictHostKeyChecking no

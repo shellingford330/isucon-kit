@@ -5,7 +5,7 @@ on:
 
 jobs:
   slow-query-log:
-    if: ${{ github.event.issue.pull_request }}
+    if: ${{ github.event.issue.pull_request && contains(github.event.comment.body, '/analyze') }}
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
@@ -18,20 +18,88 @@ jobs:
           known_hosts: unnecessary
           config: |
             Host isucon
-              HostName 35.77.214.139
+              HostName 35.78.206.73
               User root
               Port 22
               StrictHostKeyChecking no
               IdentityFile ~/.ssh/id_rsa
-      - name: Create output file
-        run: echo "Create PR comment successfully!" > output.txt
+      - name: Analyze
+        run: |
+          make mysql/pt-query-digest
+          make mysql/mysqldumpslow
+      - name: Pull slow query log analysis result
+        run: |
+          rsync -av isucon:~/pt_query_digest_analysis.txt ./
+          rsync -av isucon:~/mysqldumpslow_analysis.txt ./
+      - name: Create comment on PR
+        uses: shellingford330/pr-comment-action@v0.0.4
+        with:
+          owner: ${{ github.event.repository.owner.login }}
+          repo: ${{ github.event.repository.name }}
+          pr_number: ${{ github.event.issue.number }}
+          filepath: pt_query_digest_analysis.txt
+          template: |
+            Analyze slow query log by pt-query-digest.
+            <details>
+            <summary>Show Output</summary>
+
+            ```
+            {{ . }}
+            ```
+
+            </details>
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Comment PR
+        uses: shellingford330/pr-comment-action@v0.0.6
+        with:
+          owner: ${{ github.event.repository.owner.login }}
+          repo: ${{ github.event.repository.name }}
+          pr_number: ${{ github.event.issue.number }}
+          filepath: mysqldumpslow_analysis.txt
+          template: |
+            Analyze slow query log by mysqldumpslow.
+            <details>
+            <summary>Show Output</summary>
+
+            ```
+            {{ . }}
+            ```
+
+            </details>
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  access-log:
+    if: ${{ github.event.issue.pull_request && contains(github.event.comment.body, '/analyze') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install SSH key
+        uses: shimataro/ssh-key-action@v2
+        with:
+          key: ${{ secrets.SSH_KEY }}
+          name: id_rsa
+          known_hosts: unnecessary
+          config: |
+            Host isucon
+              HostName 35.78.206.73
+              User root
+              Port 22
+              StrictHostKeyChecking no
+              IdentityFile ~/.ssh/id_rsa
+      - name: Analyze
+        run: |
+          make nginx/alp
+      - name: Pull access log analysis result
+        run: rsync -av isucon:~/alp_analysis.txt ./
       - name: Comment PR
         uses: shellingford330/pr-comment-action@v0.0.4
         with:
           owner: ${{ github.event.repository.owner.login }}
           repo: ${{ github.event.repository.name }}
           pr_number: ${{ github.event.issue.number }}
-          filepath: output.txt
+          filepath: access.log
           template: |
             <details>
             <summary>Show Output</summary>

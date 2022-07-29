@@ -52,11 +52,11 @@ mysql/install-pt-query-digest:
 
 ## [MySQL] Run pt-query-digest
 mysql/pt-query-digest:
-	pt-query-digest ${MYSQL_SLOW_LOG_PATH} | head -n 1000
+	pt-query-digest ${MYSQL_SLOW_LOG_PATH} > pt_query_digest_analysis.txt
 
 ## [MySQL] Run mysqldumpslow
 mysql/mysqldumpslow:
-	mysqldumpslow ${MYSQL_SLOW_LOG_PATH}
+	mysqldumpslow ${MYSQL_SLOW_LOG_PATH} > mysqldumpslow_analysis.txt
 
 ## [Nginx] Restart server
 nginx/restart:
@@ -80,7 +80,8 @@ nginx/install-alp:
 ## [Nginx] Run alp
 nginx/alp:
 	# パスパラメータの正規表現の例： -m "/posts/[0-9]+,/image/.*"
-	alp json --file ${NGINX_ACCESS_LOG_PATH} -r ${ARGS}
+	# 並び替え： --sort=sum --sort=avg
+	alp json --file ${NGINX_ACCESS_LOG_PATH} -r > alp_analysis.txt
 
 ## [Redis] Install Redis
 redis/install:
