@@ -119,6 +119,13 @@ collation-server      = utf8mb4_general_ci
 # Also available for other users if required.
 # See https://mariadb.com/kb/en/unix_socket-authentication-plugin/
 
+
+slow_query_log=1
+slow_query_log_file=/var/log/mysql/mysql-slow.log
+long_query_time=0
+log_queries_not_using_indexes=1
+
+
 # this is only for embedded server
 [embedded]
 
