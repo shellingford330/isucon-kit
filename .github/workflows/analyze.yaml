@@ -25,14 +25,14 @@ jobs:
               IdentityFile ~/.ssh/id_rsa
       - name: Analyze
         run: |
-          make mysql/pt-query-digest
-          make mysql/mysqldumpslow
+          ssh isucon 'make mysql/pt-query-digest'
+          ssh isucon 'make mysql/mysqldumpslow'
       - name: Pull slow query log analysis result
         run: |
           rsync -av isucon:~/pt_query_digest_analysis.txt ./
           rsync -av isucon:~/mysqldumpslow_analysis.txt ./
       - name: Create comment on PR
-        uses: shellingford330/pr-comment-action@v0.0.4
+        uses: shellingford330/pr-comment-action@v0.0.6
         with:
           owner: ${{ github.event.repository.owner.login }}
           repo: ${{ github.event.repository.name }}
@@ -90,11 +90,11 @@ jobs:
               IdentityFile ~/.ssh/id_rsa
       - name: Analyze
         run: |
-          make nginx/alp
+          ssh isucon 'make nginx/alp'
       - name: Pull access log analysis result
         run: rsync -av isucon:~/alp_analysis.txt ./
       - name: Comment PR
-        uses: shellingford330/pr-comment-action@v0.0.4
+        uses: shellingford330/pr-comment-action@v0.0.6
         with:
           owner: ${{ github.event.repository.owner.login }}
           repo: ${{ github.event.repository.name }}
