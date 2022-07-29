@@ -75,7 +75,7 @@ jobs:
           owner: ${{ github.event.repository.owner.login }}
           repo: ${{ github.event.repository.name }}
           pr_number: ${{ github.event.issue.number }}
-          filepath: access.log
+          filepath: alp_analysis.txt
           template: |
             Analyze access log by alp.
             <details>
