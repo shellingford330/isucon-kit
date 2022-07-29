@@ -1,10 +1,10 @@
-name: Analyze
+name: Log Analysis
 on:
   issue_comment:
     types: [created]
 
 jobs:
-  slow-query-log:
+  analyze:
     if: ${{ github.event.issue.pull_request && contains(github.event.comment.body, '/analyze') }}
     runs-on: ubuntu-latest
     timeout-minutes: 3
@@ -25,14 +25,14 @@ jobs:
               IdentityFile ~/.ssh/id_rsa
       - name: Analyze
         run: |
-          make mysql/pt-query-digest
-          make mysql/mysqldumpslow
-      - name: Pull slow query log analysis result
+          ssh isucon 'make analyze'
+      - name: Pull analysis result
         run: |
           rsync -av isucon:~/pt_query_digest_analysis.txt ./
           rsync -av isucon:~/mysqldumpslow_analysis.txt ./
-      - name: Create comment on PR
-        uses: shellingford330/pr-comment-action@v0.0.4
+          rsync -av isucon:~/alp_analysis.txt ./
+      - name: Create pt-query-digest comment on PR
+        uses: shellingford330/pr-comment-action@v0.0.6
         with:
           owner: ${{ github.event.repository.owner.login }}
           repo: ${{ github.event.repository.name }}
@@ -50,7 +50,7 @@ jobs:
             </details>
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Comment PR
+      - name: Create mysqldumpslow comment on PR
         uses: shellingford330/pr-comment-action@v0.0.6
         with:
           owner: ${{ github.event.repository.owner.login }}
@@ -69,38 +69,15 @@ jobs:
             </details>
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-  access-log:
-    if: ${{ github.event.issue.pull_request && contains(github.event.comment.body, '/analyze') }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 3
-    steps:
-      - uses: actions/checkout@v3
-      - name: Install SSH key
-        uses: shimataro/ssh-key-action@v2
-        with:
-          key: ${{ secrets.SSH_KEY }}
-          name: id_rsa
-          known_hosts: unnecessary
-          config: |
-            Host isucon
-              HostName 35.78.206.73
-              User root
-              Port 22
-              StrictHostKeyChecking no
-              IdentityFile ~/.ssh/id_rsa
-      - name: Analyze
-        run: |
-          make nginx/alp
-      - name: Pull access log analysis result
-        run: rsync -av isucon:~/alp_analysis.txt ./
-      - name: Comment PR
-        uses: shellingford330/pr-comment-action@v0.0.4
+      - name: Create alp comment on PR
+        uses: shellingford330/pr-comment-action@v0.0.6
         with:
           owner: ${{ github.event.repository.owner.login }}
           repo: ${{ github.event.repository.name }}
           pr_number: ${{ github.event.issue.number }}
           filepath: access.log
           template: |
+            Analyze access log by alp.
             <details>
             <summary>Show Output</summary>
 
