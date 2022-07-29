@@ -101,6 +101,7 @@ jobs:
           pr_number: ${{ github.event.issue.number }}
           filepath: access.log
           template: |
+            Analyze access log by alp.
             <details>
             <summary>Show Output</summary>
 
