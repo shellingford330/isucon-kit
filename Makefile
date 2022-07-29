@@ -39,6 +39,10 @@ analyze: mysql/pt-query-digest mysql/mysqldumpslow nginx/alp
 app/restart:
 	systemctl restart isucondition.go.service
 
+## [App] Build
+app/build:
+	cd webapp/go && GOOS=linux GOARCH=amd64 go build -o isucondition
+
 ## [MySQL] Restart server
 mysql/restart:
 	systemctl restart mysql
@@ -85,7 +89,7 @@ nginx/install-alp:
 nginx/alp:
 	# パスパラメータの正規表現の例： -m "/posts/[0-9]+,/image/.*"
 	# 並び替え： --sort=sum --sort=avg
-	alp json --file ${NGINX_ACCESS_LOG_PATH} -r > alp_analysis.txt
+	alp json --file ${NGINX_ACCESS_LOG_PATH} -m "/api/condition/.*" -r > alp_analysis.txt
 
 ## [Redis] Install Redis
 redis/install:
