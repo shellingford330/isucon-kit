@@ -89,7 +89,7 @@ nginx/install-alp:
 nginx/alp:
 	# パスパラメータの正規表現の例： -m "/posts/[0-9]+,/image/.*"
 	# 並び替え： --sort=sum --sort=avg
-	alp json --file ${NGINX_ACCESS_LOG_PATH} -m "/api/condition/.*" -r > alp_analysis.txt
+	alp json --file ${NGINX_ACCESS_LOG_PATH} -m "/api/condition/.*,/api/isu/.*/icon,/api/isu/.*/graph,/api/isu/.*" -r > alp_analysis.txt
 
 ## [Redis] Install Redis
 redis/install:
