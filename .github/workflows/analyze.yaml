@@ -18,7 +18,7 @@ jobs:
           known_hosts: unnecessary
           config: |
             Host isucon
-              HostName 35.78.206.73
+              HostName ${{ secrets.HOST_NAME }}
               User root
               Port 22
               StrictHostKeyChecking no
