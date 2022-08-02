@@ -41,7 +41,7 @@ jobs:
           template: |
             Analyze slow query log by pt-query-digest.
             <details>
-            <summary>Show Analisys Result</summary>
+            <summary>Show Output</summary>
 
             ```
             {{ . }}
@@ -60,7 +60,7 @@ jobs:
           template: |
             Analyze slow query log by mysqldumpslow.
             <details>
-            <summary>Show Analisys Result</summary>
+            <summary>Show Output</summary>
 
             ```
             {{ . }}
@@ -79,7 +79,7 @@ jobs:
           template: |
             Analyze access log by alp.
             <details>
-            <summary>Show Analisys Result</summary>
+            <summary>Show Output</summary>
 
             ```
             {{ . }}
