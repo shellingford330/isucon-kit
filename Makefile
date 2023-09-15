@@ -36,13 +36,13 @@ analyze: mysql/pt-query-digest mysql/mysqldumpslow nginx/alp
 	@printf "${COLOR_GREEN}Success!${COLOR_DEFAULT}\n"
 
 ## [App] Restart server
-app/restart: app/build
+app/restart:
 	systemctl daemon-reload
 	systemctl restart isuports.service
 
 ## [App] Build
 app/build:
-	cd /home/isucon/webapp/go && make isuports
+	cd webapp/go && GOOS=linux GOARCH=amd64 go build -o isuports ./cmd/isuports
 
 ## [MySQL] Restart server
 mysql/restart:
