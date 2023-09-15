@@ -1,678 +1,915 @@
+# frozen_string_literal: true
+
+require 'csv'
 require 'jwt'
-require 'net/http'
-require 'openssl'
-require 'sinatra/base'
-require 'uri'
 require 'mysql2'
 require 'mysql2-cs-bind'
+require 'open3'
+require 'openssl'
+require 'set'
+require 'sinatra/base'
+require 'sinatra/cookies'
+require 'sinatra/json'
+require 'sqlite3'
 
-module Isucondition
+require_relative 'sqltrace'
+
+module Isuports
   class App < Sinatra::Base
+    enable :logging
+    set :show_exceptions, :after_handler
     configure :development do
       require 'sinatra/reloader'
       register Sinatra::Reloader
     end
+    helpers Sinatra::Cookies
 
-    SESSION_NAME = 'isucondition_ruby'
-    CONDITION_LIMIT = 20
-    FRONTEND_CONTENTS_PATH = '../public'
-    JIA_JWT_SIGNING_KEY_PATH = '../ec256-public.pem'
-    DEFAULT_ICON_FILE_PATH = '../NoImage.jpg'
-    DEFAULT_JIA_SERVICE_URL = 'http://localhost:5000'
+    before do
+      cache_control :private
+    end
 
-    MYSQL_ERR_NUM_DUPLICATE_ENTRY = 1062
-    CONDITION_LEVEL_INFO = 'info'
-    CONDITION_LEVEL_WARNING = 'warning'
-    CONDITION_LEVEL_CRITICAL = 'critical'
+    TENANT_DB_SCHEMA_FILE_PATH = '../sql/tenant/10_schema.sql'
+    INITIALIZE_SCRIPT = '../sql/init.sh'
+    COOKIE_NAME = 'isuports_session'
 
-    SCORE_CONDITION_LEVEL_INFO = 3
-    SCORE_CONDITION_LEVEL_WARNING = 2
-    SCORE_CONDITION_LEVEL_CRITICAL = 1
+    ROLE_ADMIN = 'admin'
+    ROLE_ORGANIZER = 'organizer'
+    ROLE_PLAYER = 'player'
+    ROLE_NONE = 'none'
 
-    set :session_secret, 'isucondition'
-    set :sessions, key: SESSION_NAME
+    # 正しいテナント名の正規表現
+    TENANT_NAME_REGEXP = /^[a-z][a-z0-9-]{0,61}[a-z0-9]$/
 
-    set :public_folder, FRONTEND_CONTENTS_PATH
-    set :protection, false  # IPアドレスでHTTPS接続した場合に一部機能が動かなくなるため無効化
+    # アクセスしてきた人の情報
+    Viewer = Struct.new(:role, :player_id, :tenant_name, :tenant_id, keyword_init: true)
 
-    POST_ISU_CONDITION_TARGET_BASE_URL = ENV.fetch('POST_ISUCONDITION_TARGET_BASE_URL')
-    JIA_JWT_SIGNING_KEY = OpenSSL::PKey::EC.new(File.read(JIA_JWT_SIGNING_KEY_PATH), '')
+    TenantRow = Struct.new(:id, :name, :display_name, :created_at, :updated_at, keyword_init: true)
+    PlayerRow = Struct.new(:tenant_id, :id, :display_name, :is_disqualified, :created_at, :updated_at, keyword_init: true)
+    CompetitionRow = Struct.new(:tenant_id, :id, :title, :finished_at, :created_at, :updated_at, keyword_init: true)
+    PlayerScoreRow = Struct.new(:tenant_id, :id, :player_id, :competition_id, :score, :row_num, :created_at, :updated_at, keyword_init: true)
 
-    class MySQLConnectionEnv
-      def initialize
-        @host = get_env('MYSQL_HOST', '127.0.0.1')
-        @port = get_env('MYSQL_PORT', '3306')
-        @user = get_env('MYSQL_USER', 'isucon')
-        @db_name = get_env('MYSQL_DBNAME', 'isucondition')
-        @password = get_env('MYSQL_PASS', 'isucon')
+    class HttpError < StandardError
+      attr_reader :code
+
+      def initialize(code, message)
+        super(message)
+        @code = code
       end
+    end
 
-      def connect_db
+    def initialize(*, **)
+      super
+      @trace_file_path = ENV.fetch('ISUCON_SQLITE_TRACE_FILE', '')
+      unless @trace_file_path.empty?
+        SQLite3TraceLog.open(@trace_file_path)
+      end
+    end
+
+    # エラー処理
+    error HttpError do
+      e = env['sinatra.error']
+      logger.error("error at #{request.path}: #{e.message}")
+      content_type :json
+      status e.code
+      JSON.dump(status: false)
+    end
+
+    helpers do
+      # 管理用DBに接続する
+      def connect_admin_db
+        host = ENV.fetch('ISUCON_DB_HOST', '127.0.0.1')
+        port = ENV.fetch('ISUCON_DB_PORT', '3306')
+        username = ENV.fetch('ISUCON_DB_USER', 'isucon')
+        password = ENV.fetch('ISUCON_DB_PASSWORD', 'isucon')
+        database = ENV.fetch('ISUCON_DB_NAME', 'isuports')
         Mysql2::Client.new(
-          host: @host,
-          port: @port,
-          username: @user,
-          database: @db_name,
-          password: @password,
+          host:,
+          port:,
+          username:,
+          password:,
+          database:,
           charset: 'utf8mb4',
-          database_timezone: :local,
+          database_timezone: :utc,
           cast_booleans: true,
           symbolize_keys: true,
           reconnect: true,
         )
       end
 
-      private
-
-      def get_env(key, default)
-        val = ENV.fetch(key, '')
-        return val unless val.empty?
-        default
-      end
-    end
-
-    helpers do
-      def json_params
-        @json_params ||= JSON.parse(request.body.tap(&:rewind).read, symbolize_names: true)
+      def admin_db
+        Thread.current[:admin_db] ||= connect_admin_db
       end
 
-      def db
-        Thread.current[:db] ||= MySQLConnectionEnv.new.connect_db
+      # テナントDBのパスを返す
+      def tenant_db_path(id)
+        tenant_db_dir = ENV.fetch('ISUCON_TENANT_DB_DIR', '../tenant_db')
+        File.join(tenant_db_dir, "#{id}.db")
       end
 
-      def db_transaction(&block)
-        db.query('BEGIN')
-        done = false
-        retval = block.call
-        db.query('COMMIT')
-        done = true
-        return retval
-      ensure
-        db.query('ROLLBACK') unless done
-      end
-
-      def halt_error(*args)
-        content_type 'text/plain'
-        halt(*args)
-      end
-
-
-      def user_id_from_session
-        jia_user_id = session[:jia_user_id]
-        return nil if !jia_user_id || jia_user_id.empty?
-        count = db.xquery('SELECT COUNT(*) AS `cnt` FROM `user` WHERE `jia_user_id` = ?', jia_user_id).first
-        return nil if count.fetch(:cnt).to_i.zero?
-
-        jia_user_id
-      end
-
-      def jia_service_url
-        config = db.xquery('SELECT * FROM `isu_association_config` WHERE `name` = ?', 'jia_service_url').first
-        return DEFAULT_JIA_SERVICE_URL unless config
-        config[:url]
-      end
-
-      # ISUのコンディションの文字列からコンディションレベルを計算
-      def calculate_condition_level(condition)
-        idx = -1
-        warn_count = 0
-        while idx
-          idx = condition.index('=true', idx+1)
-          warn_count += 1 if idx
-        end
-
-        case warn_count
-        when 0
-          CONDITION_LEVEL_INFO
-        when 1, 2
-          CONDITION_LEVEL_WARNING
-        when 3
-          CONDITION_LEVEL_CRITICAL
-        else
-          raise "unexpected warn count"
-        end
-      end
-
-      # ISUのコンディションの文字列がcsv形式になっているか検証
-      def valid_condition_format?(condition_str)
-        keys = %w(is_dirty= is_overweight= is_broken=)
-        value_true = 'true'
-        value_false = 'false'
-
-        idx_cond_str = 0
-        keys.each_with_index do |key, idx_keys|
-          return false unless condition_str[idx_cond_str..-1].start_with?(key)
-          idx_cond_str += key.size
-          case
-          when condition_str[idx_cond_str..-1].start_with?(value_true)
-            idx_cond_str += value_true.size
-          when condition_str[idx_cond_str..-1].start_with?(value_false)
-            idx_cond_str += value_false.size
+      # テナントDBに接続する
+      def connect_to_tenant_db(id, &block)
+        path = tenant_db_path(id)
+        ret = nil
+        database_klass =
+          if @trace_file_path.empty?
+            SQLite3::Database
           else
-            return false
+            SQLite3DatabaseWithTrace
           end
+        database_klass.new(path, results_as_hash: true) do |db|
+          db.busy_timeout = 5000
+          ret = block.call(db)
+        end
+        ret
+      end
 
-          if idx_keys < (keys.size-1)
-            return false unless condition_str[idx_cond_str] == ?,
-            idx_cond_str += 1
+      # テナントDBを新規に作成する
+      def create_tenant_db(id)
+        path = tenant_db_path(id)
+        out, status = Open3.capture2e('sh', '-c', "sqlite3 #{path} < #{TENANT_DB_SCHEMA_FILE_PATH}")
+        unless status.success?
+          raise "failed to exec sqlite3 #{path} < #{TENANT_DB_SCHEMA_FILE_PATH}, out=#{out}"
+        end
+        nil
+      end
+
+      # システム全体で一意なIDを生成する
+      def dispense_id
+        last_exception = nil
+        100.times do |i|
+          begin
+            admin_db.xquery('REPLACE INTO id_generator (stub) VALUES (?)', 'a')
+          rescue Mysql2::Error => e
+            if e.error_number == 1213 # deadlock
+              last_exception = e
+              next
+            else
+              raise e
+            end
           end
+          return admin_db.last_id.to_s(16)
+        end
+        raise last_exception
+      end
+
+      # リクエストヘッダをパースしてViewerを返す
+      def parse_viewer
+        token_str = cookies[COOKIE_NAME]
+        unless token_str
+          raise HttpError.new(401, "cookie #{COOKIE_NAME} is not found")
         end
 
-        idx_cond_str == condition_str.size
-      end
-    end
-
-    # サービスを初期化
-    post '/initialize' do
-      jia_service_url = begin
-        json_params[:jia_service_url]
-      rescue JSON::ParserError
-        halt_error 400, 'bad request body'
-      end
-      halt_error 400, 'bad request body' unless jia_service_url
-
-      system('../sql/init.sh', out: :err, exception: true)
-      db.xquery(
-        'INSERT INTO `isu_association_config` (`name`, `url`) VALUES (?, ?) ON DUPLICATE KEY UPDATE `url` = VALUES(`url`)',
-        'jia_service_url',
-        jia_service_url,
-      )
-
-      content_type :json
-      { language: 'ruby' }.to_json
-    end
-
-    # サインアップ・サインイン
-    post '/api/auth' do
-      req_jwt = request.env['HTTP_AUTHORIZATION']&.delete_prefix('Bearer ')
-      token, _headers = begin
-        JWT.decode(req_jwt, JIA_JWT_SIGNING_KEY, true, algorithm: 'ES256')
-      rescue JWT::DecodeError
-        halt_error 403, 'forbidden'
-      end
-
-      jia_user_id = token['jia_user_id']
-      halt_error 400, 'invalid JWT payload' if !jia_user_id || !jia_user_id.is_a?(String)
-
-      db.xquery('INSERT IGNORE INTO user (`jia_user_id`) VALUES (?)', jia_user_id)
-
-      session[:jia_user_id] = jia_user_id
-
-      ''
-    end
-
-    # サインアウト
-    post '/api/signout' do
-      halt_error 401, 'you are not signed in' unless user_id_from_session
-      session.destroy
-
-      status 200
-      ''
-    end
-
-    # サインインしている自分自身の情報を取得
-    get '/api/user/me' do
-      jia_user_id = user_id_from_session
-      halt_error 401, 'you are not signed in' unless jia_user_id
-
-      content_type :json
-      { jia_user_id: jia_user_id }.to_json
-    end
-
-    # ISUの一覧を取得
-    get '/api/isu' do
-      jia_user_id = user_id_from_session
-      halt_error 401, 'you are not signed in' unless jia_user_id
-
-      response_list = db_transaction do
-        isu_list = db.xquery('SELECT * FROM `isu` WHERE `jia_user_id` = ? ORDER BY `id` DESC', jia_user_id)
-        isu_list.map do |isu|
-          last_condition = db.xquery('SELECT * FROM `isu_condition` WHERE `jia_isu_uuid` = ? ORDER BY `timestamp` DESC LIMIT 1', isu.fetch(:jia_isu_uuid)).first
-
-          formatted_condition = last_condition ? {
-            jia_isu_uuid: last_condition.fetch(:jia_isu_uuid),
-            isu_name: isu.fetch(:name),
-            timestamp: last_condition.fetch(:timestamp).to_i,
-            is_sitting: last_condition.fetch(:is_sitting),
-            condition: last_condition.fetch(:condition),
-            condition_level: calculate_condition_level(last_condition.fetch(:condition)),
-            message: last_condition.fetch(:message),
-          } : nil
-
-          {
-            id: isu.fetch(:id),
-            jia_isu_uuid: isu.fetch(:jia_isu_uuid),
-            name: isu.fetch(:name),
-            character: isu.fetch(:character),
-            latest_isu_condition: formatted_condition,
-          }
-        end
-      end
-
-      content_type :json
-      response_list.to_json
-    end
-
-    # ISUを登録
-    post '/api/isu' do
-      jia_user_id = user_id_from_session
-      halt_error 401, 'you are not signed in' unless jia_user_id
-
-      jia_isu_uuid = params[:jia_isu_uuid]
-      isu_name = params[:isu_name]
-
-      fh = params[:image]
-      halt_error 400, 'bad format: icon' if fh && (!fh.kind_of?(Hash) || !fh[:tempfile].is_a?(Tempfile))
-
-      use_default_image = fh.nil?
-      image = use_default_image ? File.binread(DEFAULT_ICON_FILE_PATH) : fh.fetch(:tempfile).binmode.read
-
-      isu = db_transaction do
-        begin
-          db.xquery(
-            "INSERT INTO `isu` (`jia_isu_uuid`, `name`, `image`, `jia_user_id`) VALUES (?, ?, ?, ?)".b,
-            jia_isu_uuid.b, isu_name.b, image, jia_user_id.b,
-          )
-        rescue Mysql2::Error => e
-          if e.error_number == MYSQL_ERR_NUM_DUPLICATE_ENTRY
-            halt_error 409, "duplicated: isu"
-          end
-
-          raise
+        key_filename = ENV.fetch('ISUCON_JWT_KEY_FILE', '../public.pem')
+        key_src = File.read(key_filename)
+        key = OpenSSL::PKey::RSA.new(key_src)
+        token, _ = JWT.decode(token_str, key, true, { algorithm: 'RS256' })
+        unless token.key?('sub')
+          raise HttpError.new(401, "invalid token: subject is not found in token: #{token_str}")
         end
 
-        target_url = URI.parse("#{jia_service_url}/api/activate")
-        http = Net::HTTP.new(target_url.host, target_url.port)
-        http.use_ssl = target_url.scheme == 'https'
-        res = http.start do
-          req = Net::HTTP::Post.new(target_url.path)
-          req['content-type'] = 'application/json'
-          req.body = { target_base_url: POST_ISU_CONDITION_TARGET_BASE_URL, isu_uuid: jia_isu_uuid }.to_json
-          http.request(req)
+        unless token.key?('role')
+          raise HttpError.new(401, "invalid token: role is not found: #{token_str}")
         end
-        if res.code != '202'
-          request.env['rack.logger'].warn "JIAService returned error: status code #{res.code}, message #{res.body.inspect}"
-          halt_error res.code.to_i, 'JIAService returned error'
+        role = token.fetch('role')
+        unless [ROLE_ADMIN, ROLE_ORGANIZER, ROLE_PLAYER].include?(role)
+          raise HttpError.new(401, "invalid token: invalid role: #{token_str}")
         end
-        isu_from_jia = JSON.parse(res.body, symbolize_names: true)
 
-        db.xquery('UPDATE `isu` SET `character` = ? WHERE  `jia_isu_uuid` = ?', isu_from_jia.fetch(:character), jia_isu_uuid)
-        db.xquery('SELECT * FROM `isu` WHERE `jia_user_id` = ? AND `jia_isu_uuid` = ?', jia_user_id, jia_isu_uuid).first
-      end
-
-      status 201
-      content_type :json
-      {
-        id: isu.fetch(:id),
-        jia_isu_uuid: isu.fetch(:jia_isu_uuid),
-        name: isu.fetch(:name),
-        character: isu.fetch(:character),
-        jia_user_id: isu.fetch(:jia_user_id),
-      }.to_json
-    end
-
-    # ISUの情報を取得
-    get '/api/isu/:jia_isu_uuid' do
-      jia_user_id = user_id_from_session
-      halt_error 401, 'you are not signed in' unless jia_user_id
-
-      jia_isu_uuid = params[:jia_isu_uuid]
-      isu = db.xquery('SELECT * FROM `isu` WHERE `jia_user_id` = ? AND `jia_isu_uuid` = ?', jia_user_id, jia_isu_uuid).first
-      halt_error 404, 'not found: isu' unless isu
-
-      content_type :json
-      {
-        id: isu.fetch(:id),
-        jia_isu_uuid: isu.fetch(:jia_isu_uuid),
-        name: isu.fetch(:name),
-        character: isu.fetch(:character),
-        jia_user_id: isu.fetch(:jia_user_id),
-      }.to_json
-    end
-
-    # ISUのアイコンを取得
-    get '/api/isu/:jia_isu_uuid/icon' do
-      jia_user_id = user_id_from_session
-      halt_error 401, 'you are not signed in' unless jia_user_id
-
-      jia_isu_uuid = params[:jia_isu_uuid]
-      isu = db.xquery('SELECT `image` FROM `isu` WHERE `jia_user_id` = ? AND `jia_isu_uuid` = ?', jia_user_id, jia_isu_uuid).first
-      halt_error 404, 'not found: isu' unless isu
-
-      isu.fetch(:image)
-    end
-
-    # ISUのコンディショングラフ描画のための情報を取得
-    get '/api/isu/:jia_isu_uuid/graph' do
-      jia_user_id = user_id_from_session
-      halt_error 401, 'you are not signed in' unless jia_user_id
-
-      jia_isu_uuid = params[:jia_isu_uuid]
-      datetime_str = params[:datetime]
-      halt_error 400, 'missing: datetime' if !datetime_str || datetime_str.empty?
-      datetime = Time.at(Integer(datetime_str)) rescue halt_error(400, 'bad format: datetime')
-      date = Time.new(datetime.year, datetime.month, datetime.day, datetime.hour, 0, 0)
-
-
-      res = db_transaction do
-        cnt = db.xquery('SELECT COUNT(*) AS `cnt` FROM `isu` WHERE `jia_user_id` = ? AND `jia_isu_uuid` = ?', jia_user_id, jia_isu_uuid).first
-        halt_error 404, 'not found: isu' if cnt.fetch(:cnt) == 0
-
-        generate_isu_graph_response(jia_isu_uuid, date)
-      end
-
-      content_type :json
-      res.to_json
-    end
-
-    # グラフのデータ点を一日分生成
-    def generate_isu_graph_response(jia_isu_uuid, graph_date)
-      rows = db.xquery('SELECT * FROM `isu_condition` WHERE `jia_isu_uuid` = ? ORDER BY `timestamp` ASC', jia_isu_uuid)
-
-      data_points = []
-      start_time_in_this_hour = Time.at(0)
-      conditions_in_this_hour = []
-      timestamps_in_this_hour = []
-
-      rows.each do |condition|
-        timestamp = condition.fetch(:timestamp)
-        truncated_condition_time = Time.new(timestamp.year, timestamp.month, timestamp.day, timestamp.hour, 0, 0)
-        if truncated_condition_time != start_time_in_this_hour
-          unless conditions_in_this_hour.empty?
-            data = calculate_graph_data_point(conditions_in_this_hour)
-            data_points.push(
-              jia_isu_uuid: jia_isu_uuid,
-              start_at: start_time_in_this_hour,
-              data: data,
-              condition_timestamps: timestamps_in_this_hour,
-            )
-          end
-
-          start_time_in_this_hour = truncated_condition_time
-          conditions_in_this_hour = []
-          timestamps_in_this_hour = []
+        # aud は1要素でテナント名がはいっている
+        aud = token['aud']
+        if !aud.is_a?(Array) || aud.size != 1
+          raise HttpError.new(401, "invalid token: aud field is few or too much: #{token_str}")
         end
-        conditions_in_this_hour.push(condition)
-        timestamps_in_this_hour.push(condition.fetch(:timestamp).to_i)
-      end
+        tenant = retrieve_tenant_row_from_header
+        if tenant.name == 'admin' && role != ROLE_ADMIN
+          raise HttpError.new(401, 'tenant not found')
+        end
 
-      unless conditions_in_this_hour.empty?
-        data = calculate_graph_data_point(conditions_in_this_hour)
-        data_points.push(
-          jia_isu_uuid: jia_isu_uuid,
-          start_at: start_time_in_this_hour,
-          data: data,
-          condition_timestamps: timestamps_in_this_hour,
+        if tenant.name != aud[0]
+          raise HttpError.new(401, "invalid token: tenant name is not match with #{request.host_with_port}: #{token_str}")
+        end
+        Viewer.new(
+          role:,
+          player_id: token.fetch('sub'),
+          tenant_name: tenant.name,
+          tenant_id: tenant.id,
         )
+      rescue JWT::DecodeError => e
+        raise HttpError.new(401, "#{e.class}: #{e.message}")
       end
 
-      end_time = graph_date + (3600 * 24)
-      start_index = data_points.size
-      end_next_index = data_points.size
+      def retrieve_tenant_row_from_header
+        # JWTに入っているテナント名とHostヘッダのテナント名が一致しているか確認
+        base_host = ENV.fetch('ISUCON_BASE_HOSTNAME', '.t.isucon.local')
+        tenant_name = request.host_with_port.delete_suffix(base_host)
 
-      data_points.each_with_index do |graph, i|
-        start_index = i if start_index == data_points.size && graph.fetch(:start_at) >= graph_date
-        end_next_index = i if end_next_index == data_points.size && graph.fetch(:start_at) > end_time
+        # SaaS管理者用ドメイン
+        if tenant_name == 'admin'
+          return TenantRow.new(name: 'admin', display_name: 'admin')
+        end
+
+        # テナントの存在確認
+        tenant = admin_db.xquery('SELECT * FROM tenant WHERE name = ?', tenant_name).first
+        unless tenant
+          raise HttpError.new(401, 'tenant not found')
+        end
+        TenantRow.new(tenant)
       end
 
-      filtered_data_points = []
-      filtered_data_points = data_points[start_index...end_next_index] if start_index < end_next_index
-
-      response_list = []
-      index = 0
-      this_time = graph_date
-
-      while this_time < (graph_date + (3600*24))
-        data = nil
-        timestamps = []
-        if index < filtered_data_points.size
-          data_with_info = filtered_data_points[index]
-          if data_with_info.fetch(:start_at) == this_time
-            data = data_with_info.fetch(:data)
-            timestamps = data_with_info.fetch(:condition_timestamps)
-            index += 1
+      # 参加者を取得する
+      def retrieve_player(tenant_db, id)
+        row = tenant_db.get_first_row('SELECT * FROM player WHERE id = ?', [id])
+        if row
+          PlayerRow.new(row).tap do |player|
+            player.is_disqualified = player.is_disqualified != 0
           end
-        end
-
-        response_list.push(
-          start_at: this_time.to_i,
-          end_at: (this_time + 3600).to_i,
-          data: data,
-          condition_timestamps: timestamps,
-        )
-        this_time += 3600
-      end
-
-      response_list
-    end
-
-    # 複数のISUのコンディションからグラフの一つのデータ点を計算
-    def calculate_graph_data_point(isu_conditions)
-      conditions_count = {
-        'is_broken' => 0,
-        'is_dirty' => 0,
-        'is_overweight' => 0,
-      }
-      raw_score = 0
-
-      isu_conditions.each do |condition|
-        bad_conditions_count = 0
-
-        unless valid_condition_format?(condition.fetch(:condition))
-          raise "invalid condition format"
-        end
-
-        condition.fetch(:condition).split(',').each do |cond_str|
-          condition_name, value = cond_str.split('=')
-          if value == 'true'
-            conditions_count[condition_name] += 1
-            bad_conditions_count += 1
-          end
-        end
-
-        case
-        when bad_conditions_count >= 3
-          raw_score += SCORE_CONDITION_LEVEL_CRITICAL
-        when bad_conditions_count >= 1
-          raw_score += SCORE_CONDITION_LEVEL_WARNING
-        else
-          raw_score += SCORE_CONDITION_LEVEL_INFO
-        end
-      end
-
-      sitting_count = 0
-      isu_conditions.each do |condition|
-        sitting_count += 1 if condition.fetch(:is_sitting)
-      end
-
-      isu_conditions_length = isu_conditions.size
-      score = raw_score * 100 / 3 / isu_conditions_length
-      sitting_percentage = sitting_count * 100 / isu_conditions_length
-      is_broken_percentage = conditions_count.fetch('is_broken') * 100 / isu_conditions_length
-      is_overweight_percentage = conditions_count.fetch('is_overweight') * 100 / isu_conditions_length
-      is_dirty_percentage = conditions_count.fetch('is_dirty') * 100 / isu_conditions_length
-
-      {
-        score: score,
-        percentage: {
-          sitting: sitting_percentage,
-          is_broken: is_broken_percentage,
-          is_overweight: is_overweight_percentage,
-          is_dirty: is_dirty_percentage,
-        },
-      }
-    end
-
-    # ISUのコンディションを取得
-    get '/api/condition/:jia_isu_uuid' do
-      jia_user_id = user_id_from_session
-      halt_error 401, 'you are not signed in' unless jia_user_id
-
-      jia_isu_uuid = params[:jia_isu_uuid]
-      halt_error 400, 'missing: jia_isu_uuid' if !jia_isu_uuid || jia_isu_uuid.empty?
-
-      end_time_integer = params[:end_time].yield_self { |_| Integer(_) } rescue halt_error(400, 'bad format: end_time')
-      end_time = Time.at(end_time_integer)
-
-      condition_level_csv = params[:condition_level]
-      halt_error 400, 'missing: condition_level' if !condition_level_csv || condition_level_csv.empty?
-      condition_level = Set.new(condition_level_csv.split(','))
-
-      start_time_str = params[:start_time]
-      start_time = Time.at(start_time_str && !start_time_str.empty? ? Integer(start_time_str) : 0) rescue halt_error(400, 'bad format: start_time')
-
-      isu = db.xquery('SELECT name FROM `isu` WHERE `jia_isu_uuid` = ? AND `jia_user_id` = ?', jia_isu_uuid, jia_user_id).first
-      halt_error 404, 'not found: isu' unless isu
-      isu_name = isu.fetch(:name)
-
-      conditions_response = get_isu_conditions_from_db(
-        jia_isu_uuid,
-        end_time,
-        condition_level,
-        start_time,
-        CONDITION_LIMIT,
-        isu_name,
-      )
-
-      content_type :json
-      conditions_response.to_json
-    end
-
-    # ISUのコンディションをDBから取得
-    def get_isu_conditions_from_db(jia_isu_uuid, end_time, condition_level, start_time, limit, isu_name)
-      conditions = if start_time.to_i == 0
-        db.xquery(
-          'SELECT * FROM `isu_condition` WHERE `jia_isu_uuid` = ? AND `timestamp` < ? ORDER BY `timestamp` DESC',
-          jia_isu_uuid,
-          end_time,
-        )
-      else
-        db.xquery(
-          'SELECT * FROM `isu_condition` WHERE `jia_isu_uuid` = ? AND `timestamp` < ? AND ? <= `timestamp` ORDER BY `timestamp` DESC',
-          jia_isu_uuid,
-          end_time,
-          start_time,
-        )
-      end
-
-      conditions_response = conditions.map do |c|
-        c_level = calculate_condition_level(c.fetch(:condition))
-        if condition_level.include?(c_level)
-          {
-            jia_isu_uuid: c.fetch(:jia_isu_uuid),
-            isu_name: isu_name,
-            timestamp: c.fetch(:timestamp).to_i,
-            is_sitting: c.fetch(:is_sitting),
-            condition: c.fetch(:condition),
-            condition_level: c_level,
-            message: c.fetch(:message),
-          }
         else
           nil
         end
-      end.compact
+      end
 
-      conditions_response = conditions_response[0, limit] if conditions_response.size > limit
-      conditions_response
-    end
+      # 参加者を認可する
+      # 参加者向けAPIで呼ばれる
+      def authorize_player!(tenant_db, id)
+        player = retrieve_player(tenant_db, id)
+        unless player
+          raise HttpError.new(401, 'player not found')
+        end
+        if player.is_disqualified
+          raise HttpError.new(403, 'player is disqualified')
+        end
+        nil
+      end
 
-    # ISUの性格毎の最新のコンディション情報
-    get '/api/trend' do
-      character_list = db.query('SELECT `character` FROM `isu` GROUP BY `character`')
+      # 大会を取得する
+      def retrieve_competition(tenant_db, id)
+        row = tenant_db.get_first_row('SELECT * FROM competition WHERE id = ?', [id])
+        if row
+          CompetitionRow.new(row)
+        else
+          nil
+        end
+      end
 
-      res = character_list.map do |character|
-        isu_list = db.xquery('SELECT * FROM `isu` WHERE `character` = ?', character.fetch(:character))
-        character_info_isu_conditions = []
-        character_warning_isu_conditions = []
-        character_critical_isu_conditions = []
+      # 排他ロックのためのファイル名を生成する
+      def lock_file_path(id)
+        tenant_db_dir = ENV.fetch('ISUCON_TENANT_DB_DIR', '../tenant_db')
+        File.join(tenant_db_dir, "#{id}.lock")
+      end
 
-        isu_list.each do |isu|
-          conditions = db.xquery('SELECT * FROM `isu_condition` WHERE `jia_isu_uuid` = ? ORDER BY timestamp DESC', isu.fetch(:jia_isu_uuid)).to_a
-          unless conditions.empty?
-            isu_last_condition = conditions.first
-            condition_level = calculate_condition_level(isu_last_condition.fetch(:condition))
-            trend_condition = { isu_id: isu.fetch(:id), timestamp: isu_last_condition.fetch(:timestamp).to_i }
-            case condition_level
-            when 'info'
-              character_info_isu_conditions.push(trend_condition)
-            when 'warning'
-              character_warning_isu_conditions.push(trend_condition)
-            when 'critical'
-              character_critical_isu_conditions.push(trend_condition)
-            end
+      # 排他ロックする
+      def flock_by_tenant_id(tenant_id, &block)
+        path = lock_file_path(tenant_id)
+
+        File.open(path, File::RDONLY | File::CREAT, 0600) do |f|
+          f.flock(File::LOCK_EX)
+          block.call
+        end
+      end
+
+      # テナント名が規則に沿っているかチェックする
+      def validate_tenant_name!(name)
+        unless TENANT_NAME_REGEXP.match?(name)
+          raise HttpError.new(400, "invalid tenant name: #{name}")
+        end
+      end
+
+      BillingReport = Struct.new(
+        :competition_id,
+        :competition_title,
+        :player_count,  # スコアを登録した参加者数
+        :visitor_count, # ランキングを閲覧だけした(スコアを登録していない)参加者数
+        :billing_player_yen,  # 請求金額 スコアを登録した参加者分
+        :billing_visitor_yen, # 請求金額 ランキングを閲覧だけした(スコアを登録していない)参加者分
+        :billing_yen, # 合計請求金額
+        keyword_init: true,
+      )
+
+      # 大会ごとの課金レポートを計算する
+      def billing_report_by_competition(tenant_db, tenant_id, competition_id)
+        comp = retrieve_competition(tenant_db, competition_id)
+
+        # ランキングにアクセスした参加者のIDを取得する
+        billing_map = {}
+        admin_db.xquery('SELECT player_id, MIN(created_at) AS min_created_at FROM visit_history WHERE tenant_id = ? AND competition_id = ? GROUP BY player_id', tenant_id, comp.id).each do |vh|
+          # competition.finished_atよりもあとの場合は、終了後に訪問したとみなして大会開催内アクセス済みとみなさない
+          if comp.finished_at && comp.finished_at < vh.fetch(:min_created_at)
+            next
           end
+          billing_map[vh.fetch(:player_id)] = 'visitor'
         end
 
-        character_info_isu_conditions.sort! { |a,b| b.fetch(:timestamp) <=> a.fetch(:timestamp) }
-        character_warning_isu_conditions.sort! { |a,b| b.fetch(:timestamp) <=> a.fetch(:timestamp) }
-        character_critical_isu_conditions.sort! { |a,b| b.fetch(:timestamp) <=> a.fetch(:timestamp) }
+        # player_scoreを読んでいるときに更新が走ると不整合が起こるのでロックを取得する
+        flock_by_tenant_id(tenant_id) do
+          # スコアを登録した参加者のIDを取得する
+          tenant_db.execute('SELECT DISTINCT(player_id) FROM player_score WHERE tenant_id = ? AND competition_id = ?', [tenant_id, comp.id]) do |row|
+            pid = row.fetch('player_id')
+            # スコアが登録されている参加者
+            billing_map[pid] = 'player'
+          end
 
-        {
-          character: character.fetch(:character),
-          info: character_info_isu_conditions,
-          warning: character_warning_isu_conditions,
-          critical: character_critical_isu_conditions,
-        }
-      end
+          # 大会が終了している場合のみ請求金額が確定するので計算する
+          player_count = 0
+          visitor_count = 0
+          if comp.finished_at
+            billing_map.each_value do |category|
+              case category
+              when 'player'
+                player_count += 1
+              when 'visitor'
+                visitor_count += 1
+              end
+            end
+          end
 
-      content_type :json
-      res.to_json
-    end
-
-    # ISUからのコンディションを受け取る
-    post '/api/condition/:jia_isu_uuid' do
-      # TODO: 一定割合リクエストを落としてしのぐようにしたが、本来は全量さばけるようにすべき
-      drop_probability = 0.9
-      if rand <= drop_probability
-        request.env['rack.logger'].warn 'drop post isu condition request'
-        halt_error 202, ''
-      end
-
-      jia_isu_uuid = params[:jia_isu_uuid]
-      halt_error 400, 'missing: jia_isu_uuid' if !jia_isu_uuid || jia_isu_uuid.empty?
-
-      begin
-        json_params
-      rescue JSON::ParserError
-        halt_error 400, 'bad request body'
-      end
-      halt_error 400, 'bad request body' unless json_params.kind_of?(Array)
-      halt_error 400, 'bad request body' if json_params.empty?
-
-      db_transaction do
-        count = db.xquery('SELECT COUNT(*) AS `cnt` FROM `isu` WHERE `jia_isu_uuid` = ?', jia_isu_uuid).first
-        halt_error 404, 'not found: isu' if count.fetch(:cnt).zero?
-
-        json_params.each do |cond|
-          timestamp = Time.at(cond.fetch(:timestamp))
-          halt_error 400, 'bad request body' unless valid_condition_format?(cond.fetch(:condition))
-
-          db.xquery(
-            'INSERT INTO `isu_condition` (`jia_isu_uuid`, `timestamp`, `is_sitting`, `condition`, `message`) VALUES (?, ?, ?, ?, ?)',
-            jia_isu_uuid,
-            timestamp,
-            cond.fetch(:is_sitting),
-            cond.fetch(:condition),
-            cond.fetch(:message),
+          BillingReport.new(
+            competition_id: comp.id,
+            competition_title: comp.title,
+            player_count:,
+            visitor_count:,
+            billing_player_yen: 100 * player_count, # スコアを登録した参加者は100円
+            billing_visitor_yen: 10 * visitor_count,  # ランキングを閲覧だけした(スコアを登録していない)参加者は10円
+            billing_yen: 100 * player_count + 10 * visitor_count,
           )
         end
       end
 
-      status 202
-      ''
+      def competitions_handler(v, tenant_db)
+        competitions = []
+        tenant_db.execute('SELECT * FROM competition WHERE tenant_id=? ORDER BY created_at DESC', [v.tenant_id]) do |row|
+          comp = CompetitionRow.new(row)
+          competitions.push({
+            id: comp.id,
+            title: comp.title,
+            is_finished: !comp.finished_at.nil?,
+          })
+        end
+        json(
+          status: true,
+          data: {
+            competitions:,
+          },
+        )
+      end
     end
 
-    %w(
-      /
-      /register
-      /isu/:jia_isu_uuid
-      /isu/:jia_isu_uuid/condition
-      /isu/:jia_isu_uuid/graph
-    ).each do |_|
-      get _ do
-        content_type :html
-        File.read(File.join(FRONTEND_CONTENTS_PATH, 'index.html'))
+    # SaaS管理者向けAPI
+
+    # テナントを追加する
+    post '/api/admin/tenants/add' do
+      v = parse_viewer
+      if v.tenant_name != 'admin'
+        # admin: SaaS管理者用の特別なテナント名
+        raise HttpError.new(404, "#{v.tenant_name} has not this API")
       end
+      if v.role != ROLE_ADMIN
+        raise HttpError.new(403, 'admin role required')
+      end
+
+      display_name = params[:display_name]
+      name = params[:name]
+      validate_tenant_name!(name)
+
+      now = Time.now.to_i
+      begin
+        admin_db.xquery('INSERT INTO tenant (name, display_name, created_at, updated_at) VALUES (?, ?, ?, ?)', name, display_name, now, now)
+      rescue Mysql2::Error => e
+        if e.error_number == 1062 # duplicate entry
+          raise HttpError.new(400, 'duplicate tenant')
+        end
+        raise e
+      end
+      id = admin_db.last_id
+      # NOTE: 先にadmin_dbに書き込まれることでこのAPIの処理中に
+      #       /api/admin/tenants/billingにアクセスされるとエラーになりそう
+      #       ロックなどで対処したほうが良さそう
+      create_tenant_db(id)
+      json(
+        status: true,
+        data: {
+          tenant: {
+            id: id.to_s,
+            name: name,
+            display_name: display_name,
+            billing: 0,
+          },
+        },
+      )
+    end
+
+    # テナントごとの課金レポートを最大10件、テナントのid降順で取得する
+    # URL引数beforeを指定した場合、指定した値よりもidが小さいテナントの課金レポートを取得する
+    get '/api/admin/tenants/billing' do
+      if request.host_with_port != ENV.fetch('ISUCON_ADMIN_HOSTNAME', 'admin.t.isucon.local')
+        raise HttpError.new(404, "invalid hostname #{request.host_with_port}")
+      end
+
+      v = parse_viewer
+      if v.role != ROLE_ADMIN
+        raise HttpError.new(403, 'admin role required')
+      end
+
+      before = params[:before]
+      before_id =
+        if before
+          Integer(before, 10)
+        else
+          nil
+        end
+
+      # テナントごとに
+      #   大会ごとに
+      #     scoreが登録されているplayer * 100
+      #     scoreが登録されていないplayerでアクセスした人 * 10
+      #   を合計したものを
+      # テナントの課金とする
+      tenant_billings = []
+      admin_db.xquery('SELECT * FROM tenant ORDER BY id DESC').each do |row|
+        t = TenantRow.new(row)
+        if before_id && before_id <= t.id
+          next
+        end
+        billing_yen = 0
+        connect_to_tenant_db(t.id) do |tenant_db|
+          tenant_db.execute('SELECT * FROM competition WHERE tenant_id=?', [t.id]) do |row|
+            comp = CompetitionRow.new(row)
+            report = billing_report_by_competition(tenant_db, t.id, comp.id)
+            billing_yen += report.billing_yen
+          end
+        end
+        tenant_billings.push({
+          id: t.id.to_s,
+          name: t.name,
+          display_name: t.display_name,
+          billing: billing_yen,
+        })
+        if tenant_billings.size >= 10
+          break
+        end
+      end
+      json(
+        status: true,
+        data: {
+          tenants: tenant_billings,
+        },
+      )
+    end
+
+    # テナント管理者向けAPI - 参加者追加、一覧、失格
+
+    # 参加者一覧を返す
+    get '/api/organizer/players' do
+      v = parse_viewer
+      if v.role != ROLE_ORGANIZER
+        raise HttpError.new(403, 'role organizer required')
+      end
+
+      connect_to_tenant_db(v.tenant_id) do |tenant_db|
+        players = []
+        tenant_db.execute('SELECT * FROM player WHERE tenant_id=? ORDER BY created_at DESC', [v.tenant_id]) do |row|
+          player = PlayerRow.new(row)
+          player.is_disqualified = player.is_disqualified != 0
+          players.push(player.to_h.slice(:id, :display_name, :is_disqualified))
+        end
+
+        json(
+          status: true,
+          data: {
+            players:,
+          },
+        )
+      end
+    end
+
+    # テナントに参加者を追加する
+    post '/api/organizer/players/add' do
+      v = parse_viewer
+      if v.role != ROLE_ORGANIZER
+        raise HttpError.new(403, 'role organizer required')
+      end
+
+      connect_to_tenant_db(v.tenant_id) do |tenant_db|
+        display_names = params[:display_name]
+
+        players = display_names.map do |display_name|
+          id = dispense_id
+
+          now = Time.now.to_i
+          tenant_db.execute('INSERT INTO player (id, tenant_id, display_name, is_disqualified, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)', [id, v.tenant_id, display_name, 0, now, now])
+          player = retrieve_player(tenant_db, id)
+          player.to_h.slice(:id, :display_name, :is_disqualified)
+        end
+
+        json(
+          status: true,
+          data: {
+            players:,
+          },
+        )
+      end
+    end
+
+    # 参加者を失格にする
+    post '/api/organizer/player/:player_id/disqualified' do
+      v = parse_viewer
+      if v.role != ROLE_ORGANIZER
+        raise HttpError.new(403, 'role organizer required')
+      end
+
+      connect_to_tenant_db(v.tenant_id) do |tenant_db|
+        player_id = params[:player_id]
+
+        now = Time.now.to_i
+        tenant_db.execute('UPDATE player SET is_disqualified = ?, updated_at = ? WHERE id = ?', [1, now, player_id])
+        player = retrieve_player(tenant_db, player_id)
+        unless player
+          # 存在しないプレイヤー
+          raise HttpError.new(404, 'player not found')
+        end
+
+        json(
+          status: true,
+          data: {
+            player: player.to_h.slice(:id, :display_name, :is_disqualified),
+          },
+        )
+      end
+    end
+
+    # テナント管理者向けAPI - 大会管理
+
+    # 大会を追加する
+    post '/api/organizer/competitions/add' do
+      v = parse_viewer
+      if v.role != ROLE_ORGANIZER
+        raise HttpError.new(403, 'role organizer required')
+      end
+
+      connect_to_tenant_db(v.tenant_id) do |tenant_db|
+        title = params[:title]
+
+        now = Time.now.to_i
+        id = dispense_id
+        tenant_db.execute('INSERT INTO competition (id, tenant_id, title, finished_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)', [id, v.tenant_id, title, nil, now, now])
+
+        json(
+          status: true,
+          data: {
+            competition: {
+              id:,
+              title:,
+              is_finished: false,
+            },
+          },
+        )
+      end
+    end
+
+    # 大会を終了する
+    post '/api/organizer/competition/:competition_id/finish' do
+      v = parse_viewer
+      if v.role != ROLE_ORGANIZER
+        raise HttpError.new(403, 'role organizer required')
+      end
+
+      connect_to_tenant_db(v.tenant_id) do |tenant_db|
+        id = params[:competition_id]
+        unless retrieve_competition(tenant_db, id)
+          # 存在しない大会
+          raise HttpError.new(404, 'competition not found')
+        end
+
+        now = Time.now.to_i
+        tenant_db.execute('UPDATE competition SET finished_at = ?, updated_at = ? WHERE id = ?', [now, now, id])
+        json(
+          status: true,
+        )
+      end
+    end
+
+    # 大会のスコアをCSVでアップロードする
+    post '/api/organizer/competition/:competition_id/score' do
+      v = parse_viewer
+      if v.role != ROLE_ORGANIZER
+        raise HttpError.new(403, 'role organizer required')
+      end
+
+      connect_to_tenant_db(v.tenant_id) do |tenant_db|
+        competition_id = params[:competition_id]
+        comp = retrieve_competition(tenant_db, competition_id)
+        unless comp
+          # 存在しない大会
+          raise HttpError.new(404, 'competition not found')
+        end
+        if comp.finished_at
+          status 400
+          return json(
+            status: false,
+            message: 'competition is finished',
+          )
+        end
+
+        csv_file = params[:scores][:tempfile]
+        csv_file.set_encoding(Encoding::UTF_8)
+        csv = CSV.new(csv_file, headers: true, return_headers: true)
+        csv.readline
+        if csv.headers != ['player_id', 'score']
+          raise HttpError.new(400, 'invalid CSV headers')
+        end
+
+        # DELETEしたタイミングで参照が来ると空っぽのランキングになるのでロックする
+        flock_by_tenant_id(v.tenant_id) do
+          player_score_rows = csv.map.with_index do |row, row_num|
+            if row.size != 2
+              raise "row must have two columns: #{row}"
+            end
+            player_id, score_str = *row.values_at('player_id', 'score')
+            unless retrieve_player(tenant_db, player_id)
+              # 存在しない参加者が含まれている
+              raise HttpError.new(400, "player not found: #{player_id}")
+            end
+            score = Integer(score_str, 10)
+            id = dispense_id
+            now = Time.now.to_i
+            PlayerScoreRow.new(
+              id:,
+              tenant_id: v.tenant_id,
+              player_id:,
+              competition_id:,
+              score:,
+              row_num:,
+              created_at: now,
+              updated_at: now,
+            )
+          end
+
+          tenant_db.execute('DELETE FROM player_score WHERE tenant_id = ? AND competition_id = ?', [v.tenant_id, competition_id])
+          player_score_rows.each do |ps|
+            tenant_db.execute('INSERT INTO player_score (id, tenant_id, player_id, competition_id, score, row_num, created_at, updated_at) VALUES (:id, :tenant_id, :player_id, :competition_id, :score, :row_num, :created_at, :updated_at)', ps.to_h)
+          end
+
+          json(
+            status: true,
+            data: {
+              rows: player_score_rows.size,
+            },
+          )
+        end
+      end
+    end
+
+    # テナント内の課金レポートを取得する
+    get '/api/organizer/billing' do
+      v = parse_viewer
+      if v.role != ROLE_ORGANIZER
+        raise HttpError.new(403, 'role organizer required')
+      end
+
+      connect_to_tenant_db(v.tenant_id) do |tenant_db|
+        reports = []
+        tenant_db.execute('SELECT * FROM competition WHERE tenant_id=? ORDER BY created_at DESC', [v.tenant_id]) do |row|
+          comp = CompetitionRow.new(row)
+          reports.push(billing_report_by_competition(tenant_db, v.tenant_id, comp.id).to_h)
+        end
+        json(
+          status: true,
+          data: {
+            reports:,
+          },
+        )
+      end
+    end
+
+    # 大会の一覧を取得する
+    get '/api/organizer/competitions' do
+      v = parse_viewer
+      if v.role != ROLE_ORGANIZER
+        raise HttpError.new(403, 'role organizer required')
+      end
+
+      connect_to_tenant_db(v.tenant_id) do |tenant_db|
+        competitions_handler(v, tenant_db)
+      end
+    end
+
+    # 参加者向けAPI
+
+    # 参加者の詳細情報を取得する
+    get '/api/player/player/:player_id' do
+      v = parse_viewer
+      if v.role != ROLE_PLAYER
+        raise HttpError.new(403, 'role player required')
+      end
+
+      connect_to_tenant_db(v.tenant_id) do |tenant_db|
+        authorize_player!(tenant_db, v.player_id)
+
+        player_id = params[:player_id]
+        player = retrieve_player(tenant_db, player_id)
+        unless player
+          raise HttpError.new(404, 'player not found')
+        end
+        competitions = tenant_db.execute('SELECT * FROM competition WHERE tenant_id = ? ORDER BY created_at ASC', [v.tenant_id]).map { |row| CompetitionRow.new(row) }
+        # player_scoreを読んでいるときに更新が走ると不整合が起こるのでロックを取得する
+        flock_by_tenant_id(v.tenant_id) do
+          player_score_rows = competitions.filter_map do |c|
+            # 最後にCSVに登場したスコアを採用する = row_numが一番大きいもの
+            row = tenant_db.get_first_row('SELECT * FROM player_score WHERE tenant_id = ? AND competition_id = ? AND player_id = ? ORDER BY row_num DESC LIMIT 1', [v.tenant_id, c.id, player.id])
+            if row
+              PlayerScoreRow.new(row)
+            else
+              # 行がない = スコアが記録されてない
+              nil
+            end
+          end
+
+          scores = player_score_rows.map do |ps|
+            comp = retrieve_competition(tenant_db, ps.competition_id)
+            {
+              competition_title: comp.title,
+              score: ps.score,
+            }
+          end
+
+          json(
+            status: true,
+            data: {
+              player: player.to_h.slice(:id, :display_name, :is_disqualified),
+              scores:,
+            },
+          )
+        end
+      end
+    end
+
+    CompetitionRank = Struct.new(:rank, :score, :player_id, :player_display_name, :row_num, keyword_init: true)
+
+    # 大会ごとのランキングを取得する
+    get '/api/player/competition/:competition_id/ranking' do
+      v = parse_viewer
+      if v.role != ROLE_PLAYER
+        raise HttpError.new(403, 'role player required')
+      end
+
+      connect_to_tenant_db(v.tenant_id) do |tenant_db|
+        authorize_player!(tenant_db, v.player_id)
+
+        competition_id = params[:competition_id]
+
+        # 大会の存在確認
+        competition = retrieve_competition(tenant_db, competition_id)
+        unless competition
+          raise HttpError.new(404, 'competition not found')
+        end
+
+        now = Time.now.to_i
+        tenant = TenantRow.new(admin_db.xquery('SELECT * FROM tenant WHERE id = ?', v.tenant_id).first)
+        admin_db.xquery('INSERT INTO visit_history (player_id, tenant_id, competition_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)', v.player_id, tenant.id, competition_id, now, now)
+
+        rank_after_str = params[:rank_after]
+        rank_after =
+          if rank_after_str
+            Integer(rank_after_str, 10)
+          else
+            0
+          end
+
+        # player_scoreを読んでいるときに更新が走ると不整合が起こるのでロックを取得する
+        flock_by_tenant_id(v.tenant_id) do
+          ranks = []
+          scored_player_set = Set.new
+          tenant_db.execute('SELECT * FROM player_score WHERE tenant_id = ? AND competition_id = ? ORDER BY row_num DESC', [tenant.id, competition_id]) do |row|
+            ps = PlayerScoreRow.new(row)
+            # player_scoreが同一player_id内ではrow_numの降順でソートされているので
+            # 現れたのが2回目以降のplayer_idはより大きいrow_numでスコアが出ているとみなせる
+            if scored_player_set.member?(ps.player_id)
+              next
+            end
+            scored_player_set.add(ps.player_id)
+            player = retrieve_player(tenant_db, ps.player_id)
+            ranks.push(CompetitionRank.new(
+              score: ps.score,
+              player_id: player.id,
+              player_display_name: player.display_name,
+              row_num: ps.row_num,
+            ))
+          end
+          ranks.sort! do |a, b|
+            if a.score == b.score
+              a.row_num <=> b.row_num
+            else
+              b.score <=> a.score
+            end
+          end
+          paged_ranks = ranks.drop(rank_after).take(100).map.with_index do |rank, i|
+            {
+              rank: rank_after + i + 1,
+              score: rank.score,
+              player_id: rank.player_id,
+              player_display_name: rank.player_display_name,
+            }
+          end
+
+          json(
+            status: true,
+            data: {
+              competition: {
+                id: competition.id,
+                title: competition.title,
+                is_finished: !competition.finished_at.nil?,
+              },
+              ranks: paged_ranks,
+            },
+          )
+        end
+      end
+    end
+
+    # 大会の一覧を取得する
+    get '/api/player/competitions' do
+      v = parse_viewer
+      if v.role != ROLE_PLAYER
+        raise HttpError.new(403, 'role player required')
+      end
+
+      connect_to_tenant_db(v.tenant_id) do |tenant_db|
+        authorize_player!(tenant_db, v.player_id)
+        competitions_handler(v, tenant_db)
+      end
+    end
+
+    # 全ロール及び未認証でも使えるhandler
+
+    # JWTで認証した結果、テナントやユーザ情報を返す
+    get '/api/me' do
+      tenant = retrieve_tenant_row_from_header
+      v =
+        begin
+          parse_viewer
+        rescue HttpError => e
+          return json(
+            status: true,
+            data: {
+              tenant: tenant.to_h.slice(:name, :display_name),
+              me: nil,
+              role: ROLE_NONE,
+              logged_in: false,
+            },
+          )
+        end
+      if v.role == ROLE_ADMIN|| v.role == ROLE_ORGANIZER
+        json(
+          status: true,
+          data: {
+            tenant: tenant.to_h.slice(:name, :display_name),
+            me: nil,
+            role: v.role,
+            logged_in: true,
+          },
+        )
+      else
+        connect_to_tenant_db(v.tenant_id) do |tenant_db|
+          player = retrieve_player(tenant_db, v.player_id)
+          if player
+            json(
+              status: true,
+              data: {
+                tenant: tenant.to_h.slice(:name, :display_name),
+                me: player.to_h.slice(:id, :display_name, :is_disqualified),
+                role: v.role,
+                logged_in: true,
+              },
+            )
+          else
+            json(
+              status: true,
+              data: {
+                tenant: tenant.to_h.slice(:name, :display_name),
+                me: nil,
+                role: ROLE_NONE,
+                logged_in: false,
+              },
+            )
+          end
+        end
+      end
+    end
+
+    # ベンチマーカー向けAPI
+
+    # ベンチマーカーが起動したときに最初に呼ぶ
+    # データベースの初期化などが実行されるため、スキーマを変更した場合などは適宜改変すること
+    post '/initialize' do
+      out, status = Open3.capture2e(INITIALIZE_SCRIPT)
+      unless status.success?
+        raise HttpError.new(500, "error command execution: #{out}")
+      end
+      json(
+        status: true,
+        data: {
+          lang: 'ruby',
+        },
+      )
     end
   end
 end

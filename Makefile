@@ -37,11 +37,12 @@ analyze: mysql/pt-query-digest mysql/mysqldumpslow nginx/alp
 
 ## [App] Restart server
 app/restart:
-	systemctl restart isucondition.go.service
+	systemctl daemon-reload
+	systemctl restart isuports.service
 
 ## [App] Build
 app/build:
-	cd webapp/go && GOOS=linux GOARCH=amd64 go build -o isucondition
+	cd webapp/go && GOOS=linux GOARCH=amd64 go build -o isuports ./cmd/isuports
 
 ## [MySQL] Restart server
 mysql/restart:

@@ -12,10 +12,17 @@ use Slim\Factory\ServerRequestCreatorFactory;
 
 require __DIR__ . '/../vendor/autoload.php';
 
+error_reporting(E_ALL);
+
+set_error_handler(fn (int $code, string $description, string $file, int $line): bool => match ($code) {
+    E_NOTICE, E_WARNING => throw new ErrorException("$description in $file on line $line", $code),
+    default => false,
+});
+
 // Instantiate PHP-DI ContainerBuilder
 $containerBuilder = new ContainerBuilder();
 
-if (true) { // Should be set to true in production
+if (false) { // Should be set to true in production
     $containerBuilder->enableCompilation(__DIR__ . '/../var/cache');
 }
 
@@ -64,6 +71,9 @@ register_shutdown_function($shutdownHandler);
 
 // Add Routing Middleware
 $app->addRoutingMiddleware();
+
+// Add Body Parsing Middleware
+$app->addBodyParsingMiddleware();
 
 // Add Error Middleware
 $errorMiddleware = $app->addErrorMiddleware($displayErrorDetails, $logError, $logErrorDetails);

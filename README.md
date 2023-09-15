@@ -41,3 +41,15 @@ Host isucon
 ```sh
 $ sh ./setup.sh
 ```
+
+## Deploy
+
+### 1. Build
+
+```
+$ make build
+```
+
+### 2. Push & Create PR
+
+ファイルの変更を Commit & Push し、PR を作成すると自動でデプロイされる

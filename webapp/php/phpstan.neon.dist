@@ -1,9 +1,14 @@
 parameters:
-    level: 4
-    ignoreErrors:
-        -
-            message: '#Unreachable statement - code above always terminates\.#'
-            path: app/routes.php
-        -
-            message: '#If condition is always true\.#'
-            path: public/index.php
+  level: 4
+  paths:
+    - app
+    - public
+    - sqltrace
+    - src
+  ignoreErrors:
+    -
+      message: '#^If condition is always#'
+      path: public/index.php
+    -
+      message: '#Property App\\Isuports\\Handlers::\$logger is never read, only written\.#'
+      path: src/Isuports/Handlers.php

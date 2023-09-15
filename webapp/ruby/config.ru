@@ -1,6 +1,3 @@
-require_relative './app'
+require_relative 'app'
 
-use Rack::Logger
-use Rack::CommonLogger
-run Isucondition::App
-
+run Isuports::App
