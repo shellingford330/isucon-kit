@@ -1,1330 +1,1735 @@
-use actix_web::{web, HttpResponse};
-use chrono::DurationRound as _;
-use chrono::Offset as _;
-use chrono::TimeZone as _;
-use chrono::{DateTime, NaiveDateTime};
-use futures::StreamExt as _;
-use futures::TryStreamExt as _;
+#![allow(dead_code)]
+use actix_multipart::Multipart;
+use actix_web::http::StatusCode;
+use actix_web::middleware::Logger;
+use actix_web::{web, HttpRequest, HttpResponse, ResponseError};
+use bytes::BytesMut;
+use futures_util::stream::StreamExt as _;
+use futures_util::stream::TryStreamExt as _;
+use lazy_static::lazy_static;
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+use sqlx::mysql::{MySqlConnectOptions, MySqlDatabaseError};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection};
+use sqlx::Connection as _;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::fs;
+use tracing::error;
+use tracing_subscriber::prelude::*;
 
-const SESSION_NAME: &str = "isucondition_rust";
-const CONDITION_LIMIT: usize = 20;
-const FRONTEND_CONTENTS_PATH: &str = "../public";
-const JIA_JWT_SIGNING_KEY_PATH: &str = "../ec256-public.pem";
-const DEFAULT_ICON_FILE_PATH: &str = "../NoImage.jpg";
-const DEFAULT_JIA_SERVICE_URL: &str = "http://localhost:5000";
-const MYSQL_ERR_NUM_DUPLICATE_ENTRY: u16 = 1062;
-const CONDITION_LEVEL_INFO: &str = "info";
-const CONDITION_LEVEL_WARNING: &str = "warning";
-const CONDITION_LEVEL_CRITICAL: &str = "critical";
-const SCORE_CONDITION_LEVEL_INFO: i64 = 3;
-const SCORE_CONDITION_LEVEL_WARNING: i64 = 2;
-const SCORE_CONDITION_LEVEL_CRITICAL: i64 = 1;
+const TENANT_DB_SCHEMA_FILE_PATH: &str = "../sql/tenant/10_schema.sql";
+const INITIALIZE_SCRIPT: &str = "../sql/init.sh";
+const COOKIE_NAME: &str = "isuports_session";
 
-lazy_static::lazy_static! {
-    static ref JIA_JWT_SIGNING_KEY_PEM: Vec<u8> = std::fs::read(JIA_JWT_SIGNING_KEY_PATH).expect("failed to read JIA JWT signing key file");
-    static ref JIA_JWT_SIGNING_KEY: jsonwebtoken::DecodingKey<'static> = jsonwebtoken::DecodingKey::from_ec_pem(&JIA_JWT_SIGNING_KEY_PEM).expect("failed to parse JIA JWT signing key");
+const ROLE_ADMIN: &str = "admin";
+const ROLE_ORGANIZER: &str = "organizer";
+const ROLE_PLAYER: &str = "player";
 
-    // JIAへのactivate時に登録する，ISUがconditionを送る先のURL
-    static ref POST_ISUCONDITION_TARGET_BASE_URL: String = std::env::var("POST_ISUCONDITION_TARGET_BASE_URL").expect("missing: POST_ISUCONDITION_TARGET_BASE_URL");
-
-    static ref JST_OFFSET: chrono::FixedOffset = chrono::FixedOffset::east(9 * 60 * 60);
+lazy_static! {
+    // 正しいテナント名の正規表現
+    static ref TENANT_NAME_REGEXP: Regex = Regex::new(r"^[a-z][a-z0-9-]{0,61}[a-z0-9]$").unwrap();
 }
 
-#[derive(Debug, sqlx::FromRow)]
-struct Config {
-    name: String,
-    url: String,
+#[derive(Debug, thiserror::Error)]
+enum Error {
+    #[error("flock error: {0}")]
+    Flock(#[from] nix::Error),
+    #[error("SQLx error: {0}")]
+    Sqlx(#[from] sqlx::Error),
+    #[error("Multipart error: {0}")]
+    Multipart(#[from] actix_multipart::MultipartError),
+    #[error("CSV error: {0}")]
+    Csv(#[from] csv::Error),
+    #[error("{1}")]
+    Custom(StatusCode, Cow<'static, str>),
+    #[error("{0}")]
+    Internal(Cow<'static, str>),
 }
 
-#[derive(Debug, serde::Serialize)]
-struct Isu {
-    id: i64,
-    jia_isu_uuid: String,
-    name: String,
-    #[serde(skip)]
-    image: Vec<u8>,
-    character: String,
-    #[serde(skip)]
-    jia_user_id: String,
-    #[serde(skip)]
-    created_at: DateTime<chrono::FixedOffset>,
-    #[serde(skip)]
-    updated_at: DateTime<chrono::FixedOffset>,
-}
-impl sqlx::FromRow<'_, sqlx::mysql::MySqlRow> for Isu {
-    fn from_row(row: &sqlx::mysql::MySqlRow) -> sqlx::Result<Self> {
-        use sqlx::Row as _;
-
-        let created_at: NaiveDateTime = row.try_get("created_at")?;
-        let updated_at: NaiveDateTime = row.try_get("updated_at")?;
-        // DB の datetime 型は JST として解釈する
-        let created_at = JST_OFFSET.from_local_datetime(&created_at).unwrap();
-        let updated_at = JST_OFFSET.from_local_datetime(&updated_at).unwrap();
-        Ok(Self {
-            id: row.try_get("id")?,
-            jia_isu_uuid: row.try_get("jia_isu_uuid")?,
-            name: row.try_get("name")?,
-            image: row.try_get("image")?,
-            character: row.try_get("character")?,
-            jia_user_id: row.try_get("jia_user_id")?,
-            created_at,
-            updated_at,
-        })
+// エラー処理
+impl ResponseError for Error {
+    fn error_response(&self) -> HttpResponse {
+        #[derive(Debug, Serialize)]
+        struct FailureResult {
+            status: bool,
+        }
+        const FAILURE_RESULT: FailureResult = FailureResult { status: false };
+        error!("{}", self);
+        HttpResponse::build(self.status_code()).json(&FAILURE_RESULT)
     }
-}
 
-#[derive(Debug, serde::Deserialize)]
-struct IsuFromJIA {
-    character: String,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct GetIsuListResponse {
-    id: i64,
-    jia_isu_uuid: String,
-    name: String,
-    character: String,
-    latest_isu_condition: Option<GetIsuConditionResponse>,
-}
-
-#[derive(Debug)]
-struct IsuCondition {
-    id: i64,
-    jia_isu_uuid: String,
-    timestamp: DateTime<chrono::FixedOffset>,
-    is_sitting: bool,
-    condition: String,
-    message: String,
-    created_at: DateTime<chrono::FixedOffset>,
-}
-impl sqlx::FromRow<'_, sqlx::mysql::MySqlRow> for IsuCondition {
-    fn from_row(row: &sqlx::mysql::MySqlRow) -> sqlx::Result<Self> {
-        use sqlx::Row as _;
-
-        let timestamp: NaiveDateTime = row.try_get("timestamp")?;
-        let created_at: NaiveDateTime = row.try_get("created_at")?;
-        // DB の datetime 型は JST として解釈する
-        let timestamp = JST_OFFSET.from_local_datetime(&timestamp).unwrap();
-        let created_at = JST_OFFSET.from_local_datetime(&created_at).unwrap();
-        Ok(Self {
-            id: row.try_get("id")?,
-            jia_isu_uuid: row.try_get("jia_isu_uuid")?,
-            timestamp,
-            is_sitting: row.try_get("is_sitting")?,
-            condition: row.try_get("condition")?,
-            message: row.try_get("message")?,
-            created_at,
-        })
-    }
-}
-
-#[derive(Debug)]
-struct MySQLConnectionEnv {
-    host: String,
-    port: u16,
-    user: String,
-    db_name: String,
-    password: String,
-}
-impl Default for MySQLConnectionEnv {
-    fn default() -> Self {
-        let port = if let Ok(port) = std::env::var("MYSQL_PORT") {
-            port.parse().unwrap_or(3306)
-        } else {
-            3306
-        };
-        Self {
-            host: std::env::var("MYSQL_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
-            port,
-            user: std::env::var("MYSQL_USER").unwrap_or_else(|_| "isucon".to_owned()),
-            db_name: std::env::var("MYSQL_DBNAME").unwrap_or_else(|_| "isucondition".to_owned()),
-            password: std::env::var("MYSQL_PASS").unwrap_or_else(|_| "isucon".to_owned()),
+    fn status_code(&self) -> StatusCode {
+        match *self {
+            Self::Custom(code, _) => code,
+            Self::Flock(_)
+            | Self::Sqlx(_)
+            | Self::Multipart(_)
+            | Self::Csv(_)
+            | Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct InitializeRequest {
-    jia_service_url: String,
+// 環境変数を取得する, なければデフォルト値を返す
+fn get_env(key: &str, default: &str) -> String {
+    match std::env::var(key) {
+        Ok(val) => val,
+        Err(_) => default.to_string(),
+    }
 }
 
-#[derive(Debug, serde::Serialize)]
-struct InitializeResponse {
-    language: String,
+// テナントDBのパスを返す
+fn tenant_db_path(id: i64) -> PathBuf {
+    let tenant_db_dir = get_env("ISUCON_TENANT_DB_DIR", "../tenant_db");
+    PathBuf::from(tenant_db_dir).join(format!("{}.db", id))
 }
 
-#[derive(Debug, serde::Serialize)]
-struct GetMeResponse {
-    jia_user_id: String,
+// テナントDBに接続する
+async fn connect_to_tenant_db(id: i64) -> sqlx::Result<SqliteConnection> {
+    let p = tenant_db_path(id);
+    SqliteConnection::connect_with(&SqliteConnectOptions::new().filename(p)).await
 }
 
-#[derive(Debug, serde::Serialize)]
-struct GraphResponse {
-    start_at: i64,
-    end_at: i64,
-    data: Option<GraphDataPoint>,
-    condition_timestamps: Vec<i64>,
+// テナントDBを新規に作成する
+async fn create_tenant_db(id: i64) -> Result<(), Error> {
+    let p = tenant_db_path(id);
+    let output = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "sqlite3 {} < {}",
+            p.display(),
+            TENANT_DB_SCHEMA_FILE_PATH
+        ))
+        .output()
+        .await
+        .map_err(|e| {
+            Error::Internal(
+                format!(
+                    "failed to exec sqlite3 {} < {}: {}",
+                    p.display(),
+                    TENANT_DB_SCHEMA_FILE_PATH,
+                    e
+                )
+                .into(),
+            )
+        })?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(Error::Internal(
+            format!(
+                "failed to exec sqlite {} < {}, out={}, err={}",
+                p.display(),
+                TENANT_DB_SCHEMA_FILE_PATH,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into(),
+        ))
+    }
 }
 
-#[derive(Debug, serde::Serialize)]
-struct GraphDataPoint {
-    score: i64,
-    percentage: ConditionsPercentage,
-}
+// システム全体で一意なIDを生成する
+async fn dispense_id(admin_db: &sqlx::MySqlPool) -> sqlx::Result<String> {
+    let mut last_err = None;
+    for _ in 1..100 {
+        match sqlx::query("REPLACE INTO id_generator (stub) VALUES (?);")
+            .bind("a")
+            .execute(admin_db)
+            .await
+        {
+            Ok(ret) => return Ok(format!("{:x}", ret.last_insert_id())),
+            Err(e) => {
+                if let Some(database_error) = e.as_database_error() {
+                    if let Some(merr) = database_error.try_downcast_ref::<MySqlDatabaseError>() {
+                        if merr.number() == 1213 {
+                            // deadlock
+                            last_err = Some(e);
+                            continue;
+                        }
+                    }
+                }
+                return Err(e);
+            }
+        }
+    }
 
-#[derive(Debug, serde::Serialize)]
-struct ConditionsPercentage {
-    sitting: i64,
-    is_broken: i64,
-    is_dirty: i64,
-    is_overweight: i64,
-}
-
-#[derive(Debug)]
-struct GraphDataPointWithInfo {
-    jia_isu_uuid: String,
-    start_at: DateTime<chrono::FixedOffset>,
-    data: GraphDataPoint,
-    condition_timestamps: Vec<i64>,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct GetIsuConditionResponse {
-    jia_isu_uuid: String,
-    isu_name: String,
-    timestamp: i64,
-    is_sitting: bool,
-    condition: String,
-    condition_level: &'static str,
-    message: String,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct TrendResponse {
-    character: String,
-    info: Vec<TrendCondition>,
-    warning: Vec<TrendCondition>,
-    critical: Vec<TrendCondition>,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct TrendCondition {
-    #[serde(rename = "isu_id")]
-    id: i64,
-    timestamp: i64,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct PostIsuConditionRequest {
-    is_sitting: bool,
-    condition: String,
-    message: String,
-    timestamp: i64,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct JIAServiceRequest<'a> {
-    target_base_url: &'a str,
-    isu_uuid: &'a str,
+    Err(last_err.unwrap())
 }
 
 #[actix_web::main]
-async fn main() -> std::io::Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info,sqlx=warn"))
-        .init();
-    let mysql_connection_env = MySQLConnectionEnv::default();
-
-    let pool = sqlx::mysql::MySqlPoolOptions::new()
-        .max_connections(10)
-        .after_connect(|conn| {
-            Box::pin(async move {
-                use sqlx::Executor as _;
-                // DB のタイムゾーンを JST に強制する
-                conn.execute("set time_zone = '+09:00'").await?;
-                Ok(())
-            })
-        })
-        .connect_with(
-            sqlx::mysql::MySqlConnectOptions::new()
-                .host(&mysql_connection_env.host)
-                .port(mysql_connection_env.port)
-                .database(&mysql_connection_env.db_name)
-                .username(&mysql_connection_env.user)
-                .password(&mysql_connection_env.password),
-        )
-        .await
-        .expect("failed to connect db");
-
-    let mut session_key = std::env::var("SESSION_KEY")
-        .map(|k| k.into_bytes())
-        .unwrap_or_else(|_| b"isucondition".to_vec());
-    if session_key.len() < 32 {
-        session_key.resize(32, 0);
+pub async fn main() -> std::io::Result<()> {
+    if std::env::var_os("RUST_LOG").is_none() {
+        std::env::set_var("RUST_LOG", "info,sqlx=warn");
     }
 
-    let server = actix_web::HttpServer::new(move || {
-        actix_web::App::new()
-            .app_data(web::JsonConfig::default().error_handler(|err, _| {
-                if matches!(err, actix_web::error::JsonPayloadError::Deserialize(_)) {
-                    actix_web::error::ErrorBadRequest("bad request body")
-                } else {
-                    actix_web::error::ErrorBadRequest(err)
-                }
-            }))
-            .app_data(web::Data::new(pool.clone()))
-            .wrap(actix_web::middleware::Logger::default())
-            .wrap(
-                actix_session::CookieSession::signed(&session_key)
-                    .secure(false)
-                    .name(SESSION_NAME)
-                    .max_age(2592000),
+    let default_env_filter = tracing_subscriber::EnvFilter::from_default_env();
+    if let Ok(sql_trace_file) = std::env::var("ISUCON_SQL_TRACE_FILE") {
+        // SQLのクエリログを出力する設定
+        // 環境変数 ISUCON_SQL_TRACE_FILE を設定すると、そのファイルにクエリログを出力する
+        // 未設定なら出力しない
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_writer(
+                        std::fs::File::options()
+                            .create(true)
+                            .append(true)
+                            .open(sql_trace_file)?,
+                    )
+                    .with_target(false)
+                    .with_filter(tracing_subscriber::EnvFilter::new("sqlx::query=info")),
             )
-            .service(post_initialize)
-            .service(post_authentication)
-            .service(post_signout)
-            .service(get_me)
-            .service(get_isu_list)
-            .service(post_isu)
-            .service(get_isu_id)
-            .service(get_isu_icon)
-            .service(get_isu_graph)
-            .service(get_isu_conditions)
-            .service(get_trend)
-            .service(post_isu_condition)
-            .route("/", web::get().to(get_index))
-            .route("/isu/{jia_isu_uuid}", web::get().to(get_index))
-            .route("/isu/{jia_isu_uuid}/condition", web::get().to(get_index))
-            .route("/isu/{jia_isu_uuid}/graph", web::get().to(get_index))
-            .route("/register", web::get().to(get_index))
-            .service(actix_files::Files::new(
-                "/assets",
-                std::path::Path::new(FRONTEND_CONTENTS_PATH).join("assets"),
-            ))
+            .with(tracing_subscriber::fmt::layer().with_filter(default_env_filter))
+            .init();
+    } else {
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_filter(default_env_filter))
+            .init();
+    }
+
+    let mysql_config = MySqlConnectOptions::new()
+        .host(&get_env("ISUCON_DB_HOST", "127.0.0.1"))
+        .username(&get_env("ISUCON_DB_USER", "isucon"))
+        .password(&get_env("ISUCON_DB_PASSWORD", "isucon"))
+        .database(&get_env("ISUCON_DB_NAME", "isuports"))
+        .port(
+            get_env("ISUCON_DB_PORT", "3306")
+                .parse()
+                .expect("failed to parse port number"),
+        );
+    let pool = sqlx::mysql::MySqlPoolOptions::new()
+        .max_connections(10)
+        .connect_with(mysql_config)
+        .await
+        .expect("failed to connect mysql db");
+    let server = actix_web::HttpServer::new(move || {
+        // SaaS管理者向けAPI
+        let admin_api = web::scope("/admin/tenants")
+            .route("/add", web::post().to(tenants_add_handler))
+            .route("/billing", web::get().to(tenants_billing_handler));
+
+        // テナント管理者向けAPI - 参加者追加、一覧、失格
+        let organizer_api = web::scope("/organizer")
+            .route("players", web::get().to(players_list_handler))
+            .route("players/add", web::post().to(players_add_handler))
+            .route(
+                "player/{player_id}/disqualified",
+                web::post().to(player_disqualified_handler),
+            )
+            // テナント管理者向けAPI - 大会管理
+            .route("competitions/add", web::post().to(competitions_add_handler))
+            .route(
+                "competition/{competition_id}/finish",
+                web::post().to(competition_finish_handler),
+            )
+            .route(
+                "competition/{competition_id}/score",
+                web::post().to(competition_score_handler),
+            )
+            .route("billing", web::get().to(billing_handler))
+            .route(
+                "competitions",
+                web::get().to(organizer_competitions_handler),
+            );
+
+        // 参加者向けAPI
+        let player_api = web::scope("/player")
+            .route("/player/{player_id}", web::get().to(player_handler))
+            .route(
+                "/competition/{competition_id}/ranking",
+                web::get().to(competition_ranking_handler),
+            )
+            .route("competitions", web::get().to(player_competitions_handler));
+
+        actix_web::App::new()
+            .wrap(Logger::default())
+            .wrap_fn(|req, srv| {
+                // 全APIにCache-Control: privateを設定する
+                use actix_web::dev::Service as _;
+                let fut = srv.call(req);
+                async {
+                    let mut res = fut.await?;
+                    res.headers_mut().insert(
+                        actix_web::http::header::CACHE_CONTROL,
+                        actix_web::http::header::HeaderValue::from_static("private"),
+                    );
+                    Ok(res)
+                }
+            })
+            .app_data(web::Data::new(pool.clone()))
+            // ベンチマーカー向けAPI
+            .route("/initialize", web::post().to(initialize_handler))
+            .service(
+                web::scope("/api")
+                    .service(admin_api)
+                    .service(organizer_api)
+                    .service(player_api)
+                    // 全ロール及び未認証でも使えるhandler
+                    .route("/me", web::get().to(me_handler)),
+            )
     });
-    let server = if let Some(l) = listenfd::ListenFd::from_env().take_tcp_listener(0)? {
+
+    if let Some(l) = listenfd::ListenFd::from_env().take_tcp_listener(0)? {
         server.listen(l)?
     } else {
         server.bind((
             "0.0.0.0",
             std::env::var("SERVER_APP_PORT")
-                .map(|port_str| port_str.parse().expect("Failed to parse SERVER_APP_PORT"))
+                .ok()
+                .and_then(|port_str| port_str.parse().ok())
                 .unwrap_or(3000),
         ))?
-    };
-    server.run().await
-}
-
-#[derive(Debug)]
-struct SqlxError(sqlx::Error);
-impl std::fmt::Display for SqlxError {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        self.0.fmt(f)
     }
-}
-impl actix_web::ResponseError for SqlxError {
-    fn error_response(&self) -> HttpResponse {
-        log::error!("db error: {}", self.0);
-        HttpResponse::InternalServerError()
-            .content_type(mime::TEXT_PLAIN)
-            .body(format!("SQLx error: {:?}", self.0))
-    }
-}
-
-#[derive(Debug)]
-struct ReqwestError(reqwest::Error);
-impl std::fmt::Display for ReqwestError {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-impl actix_web::ResponseError for ReqwestError {
-    fn error_response(&self) -> HttpResponse {
-        HttpResponse::InternalServerError()
-            .content_type(mime::TEXT_PLAIN)
-            .body(format!("reqwest error: {:?}", self.0))
-    }
-}
-
-/*
- * sqlx の MySQL ドライバには
- *
- * - commit()/rollback() していないトランザクション (sqlx::Transaction) が drop される
- *   - このとき drop 後に自動的に ROLLBACK が実行される
- * - fetch_one()/fetch_optional() のように MySQL からのレスポンスを最後まで読まない関数を最後に使っ
- *   ている
- *
- * の両方を満たす場合に、sqlx::Transaction が drop された後に panic する不具合がある。
- * panic しても正常にレスポンスは返されておりアプリケーションとしての動作には影響無い。
- *
- * この不具合を回避するため、fetch() したストリームを最後まで詠み込むような
- * fetch_one()/fetch_optional() をここで定義し、アプリケーションコードではトランザクションに関して
- * これらの関数を使うことにする。
- *
- * 上記のワークアラウンド以外にも、sqlx::Transaction が drop される前に必ず commit()/rollback() を
- * 呼ぶように気をつけて実装することでも不具合を回避できる。
- *
- * - https://github.com/launchbadge/sqlx/issues/1078
- * - https://github.com/launchbadge/sqlx/issues/1358
- *
- * この関数は ISUCON11 予選本番当日には存在せず、後日不具合が発覚したため後から追加された。
- * 当日はベンチマーカーによるアプリケーション互換性チェックのときに実際に panic が発生していたが、
- * アプリケーション互換性チェックは正常に通過し、負荷走行中も悪影響はほとんどなかったと考えられる。
- */
-
-async fn fetch_one_as<'q, 'c, O>(
-    query: sqlx::query::QueryAs<'q, sqlx::MySql, O, sqlx::mysql::MySqlArguments>,
-    tx: &mut sqlx::Transaction<'c, sqlx::MySql>,
-) -> sqlx::Result<O>
-where
-    O: 'q + Send + Unpin + for<'r> sqlx::FromRow<'r, sqlx::mysql::MySqlRow>,
-{
-    match fetch_optional_as(query, tx).await? {
-        Some(row) => Ok(row),
-        None => Err(sqlx::Error::RowNotFound),
-    }
-}
-
-async fn fetch_one_scalar<'q, 'c, O>(
-    query: sqlx::query::QueryScalar<'q, sqlx::MySql, O, sqlx::mysql::MySqlArguments>,
-    tx: &mut sqlx::Transaction<'c, sqlx::MySql>,
-) -> sqlx::Result<O>
-where
-    O: 'q + Send + Unpin,
-    (O,): for<'r> sqlx::FromRow<'r, sqlx::mysql::MySqlRow>,
-{
-    match fetch_optional_scalar(query, tx).await? {
-        Some(row) => Ok(row),
-        None => Err(sqlx::Error::RowNotFound),
-    }
-}
-
-async fn fetch_optional_as<'q, 'c, O>(
-    query: sqlx::query::QueryAs<'q, sqlx::MySql, O, sqlx::mysql::MySqlArguments>,
-    tx: &mut sqlx::Transaction<'c, sqlx::MySql>,
-) -> sqlx::Result<Option<O>>
-where
-    O: Send + Unpin + for<'r> sqlx::FromRow<'r, sqlx::mysql::MySqlRow>,
-{
-    let mut rows = query.fetch(tx);
-    let mut resp = None;
-    while let Some(row) = rows.next().await {
-        let row = row?;
-        if resp.is_none() {
-            resp = Some(row);
-        }
-    }
-    Ok(resp)
-}
-
-async fn fetch_optional_scalar<'q, 'c, O>(
-    query: sqlx::query::QueryScalar<'q, sqlx::MySql, O, sqlx::mysql::MySqlArguments>,
-    tx: &mut sqlx::Transaction<'c, sqlx::MySql>,
-) -> sqlx::Result<Option<O>>
-where
-    O: 'q + Send + Unpin,
-    (O,): for<'r> sqlx::FromRow<'r, sqlx::mysql::MySqlRow>,
-{
-    let mut rows = query.fetch(tx);
-    let mut resp = None;
-    while let Some(row) = rows.next().await {
-        let row = row?;
-        if resp.is_none() {
-            resp = Some(row);
-        }
-    }
-    Ok(resp)
-}
-
-async fn require_signed_in<'e, 'c, E>(
-    executor: E,
-    session: actix_session::Session,
-) -> actix_web::Result<String>
-where
-    'c: 'e,
-    E: 'e + sqlx::Executor<'c, Database = sqlx::MySql>,
-{
-    if let Some(jia_user_id) = session.get("jia_user_id")? {
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM `user` WHERE `jia_user_id` = ?")
-            .bind(&jia_user_id)
-            .fetch_one(executor)
-            .await
-            .map_err(SqlxError)?;
-        if count == 0 {
-            Err(actix_web::error::ErrorUnauthorized("not found: user"))
-        } else {
-            Ok(jia_user_id)
-        }
-    } else {
-        Err(actix_web::error::ErrorUnauthorized("you are not signed in"))
-    }
-}
-
-async fn get_jia_service_url(tx: &mut sqlx::Transaction<'_, sqlx::MySql>) -> sqlx::Result<String> {
-    let config: Option<Config> = fetch_optional_as(
-        sqlx::query_as("SELECT * FROM `isu_association_config` WHERE `name` = ?")
-            .bind("jia_service_url"),
-        tx,
-    )
-    .await?;
-    Ok(config
-        .map(|c| c.url)
-        .unwrap_or_else(|| DEFAULT_JIA_SERVICE_URL.to_owned()))
-}
-
-// サービスを初期化
-#[actix_web::post("/initialize")]
-async fn post_initialize(
-    pool: web::Data<sqlx::MySqlPool>,
-    request: web::Json<InitializeRequest>,
-) -> actix_web::Result<HttpResponse> {
-    let status = tokio::process::Command::new("../sql/init.sh")
-        .status()
-        .await
-        .map_err(|e| {
-            log::error!("exec init.sh error: {}", e);
-            e
-        })?;
-    if !status.success() {
-        log::error!("exec init.sh failed with exit code {:?}", status.code());
-        return Err(actix_web::error::ErrorInternalServerError(""));
-    }
-
-    sqlx::query(
-        "INSERT INTO `isu_association_config` (`name`, `url`) VALUES (?, ?) ON DUPLICATE KEY UPDATE `url` = VALUES(`url`)",
-    )
-    .bind("jia_service_url")
-    .bind(&request.jia_service_url)
-    .execute(pool.as_ref())
+    .run()
     .await
-    .map_err(SqlxError)?;
-    Ok(HttpResponse::Ok().json(InitializeResponse {
-        language: "rust".to_owned(),
-    }))
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Serialize)]
+struct SuccessResult<T> {
+    status: bool,
+    data: T,
+}
+
+#[derive(Debug, Serialize)]
+struct FailureResult {
+    status: bool,
+    message: String,
+}
+
+#[derive(Debug)]
+struct Viewer {
+    role: String,
+    player_id: String,
+    tenant_name: String,
+    tenant_id: i64,
+}
+
+#[derive(Debug, Deserialize)]
 struct Claims {
-    jia_user_id: String,
+    sub: Option<String>,
+    #[serde(default)]
+    aud: Vec<String>,
+    role: Option<String>,
 }
 
-// サインアップ・サインイン
-#[actix_web::post("/api/auth")]
-async fn post_authentication(
-    pool: web::Data<sqlx::MySqlPool>,
-    request: actix_web::HttpRequest,
-    session: actix_session::Session,
-) -> actix_web::Result<HttpResponse> {
-    let req_jwt = request
-        .headers()
-        .get("Authorization")
-        .map(|value| value.to_str().unwrap_or_default())
-        .unwrap_or_default()
-        .trim_start_matches("Bearer ");
+// リクエストヘッダをパースしてViewerを返す
+async fn parse_viewer(admin_db: &sqlx::MySqlPool, request: &HttpRequest) -> Result<Viewer, Error> {
+    let cookie = request.cookie(COOKIE_NAME);
+    if cookie.is_none() {
+        return Err(Error::Custom(
+            StatusCode::UNAUTHORIZED,
+            format!("cookie {} is not found", COOKIE_NAME).into(),
+        ));
+    }
+    let cookie = cookie.unwrap();
+    let token_str = cookie.value();
 
-    let validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::ES256);
-    let token = match jsonwebtoken::decode(req_jwt, &JIA_JWT_SIGNING_KEY, &validation) {
-        Ok(token) => token,
-        Err(e) => {
-            if matches!(e.kind(), jsonwebtoken::errors::ErrorKind::Json(_)) {
-                return Err(actix_web::error::ErrorBadRequest("invalid JWT payload"));
-            } else {
-                return Err(actix_web::error::ErrorForbidden("forbidden"));
-            }
-        }
-    };
-
-    let claims: Claims = token.claims;
-    let jia_user_id = claims.jia_user_id;
-
-    sqlx::query("INSERT IGNORE INTO user (`jia_user_id`) VALUES (?)")
-        .bind(&jia_user_id)
-        .execute(pool.as_ref())
-        .await
-        .map_err(SqlxError)?;
-
-    session.insert("jia_user_id", jia_user_id).map_err(|e| {
-        log::error!("failed to set cookie: {}", e);
-        e
+    let key_filename = get_env("ISUCON_JWT_KEY_FILE", "../public.pem");
+    let key_src = fs::read(&key_filename).await.map_err(|e| {
+        Error::Internal(format!("error fs::read: key_filename={}: {}", key_filename, e).into())
     })?;
 
-    Ok(HttpResponse::Ok().finish())
-}
+    let key = jsonwebtoken::DecodingKey::from_rsa_pem(&key_src).map_err(|e| {
+        Error::Internal(format!("error jsonwebtoken::DecodingKey::from_rsa_pem: {}", e).into())
+    })?;
 
-// サインアウト
-#[actix_web::post("/api/signout")]
-async fn post_signout(session: actix_session::Session) -> actix_web::Result<HttpResponse> {
-    if session.remove("jia_user_id").is_some() {
-        Ok(HttpResponse::Ok().finish())
-    } else {
-        Err(actix_web::error::ErrorUnauthorized("you are not signed in"))
-    }
-}
-
-// サインインしている自分自身の情報を取得
-#[actix_web::get("/api/user/me")]
-async fn get_me(
-    pool: web::Data<sqlx::MySqlPool>,
-    session: actix_session::Session,
-) -> actix_web::Result<HttpResponse> {
-    let jia_user_id = require_signed_in(pool.as_ref(), session).await?;
-    Ok(HttpResponse::Ok().json(GetMeResponse { jia_user_id }))
-}
-
-// ISUの一覧を取得
-#[actix_web::get("/api/isu")]
-async fn get_isu_list(
-    pool: web::Data<sqlx::MySqlPool>,
-    session: actix_session::Session,
-) -> actix_web::Result<HttpResponse> {
-    let jia_user_id = require_signed_in(pool.as_ref(), session).await?;
-
-    let mut tx = pool.begin().await.map_err(SqlxError)?;
-
-    let isu_list: Vec<Isu> =
-        sqlx::query_as("SELECT * FROM `isu` WHERE `jia_user_id` = ? ORDER BY `id` DESC")
-            .bind(&jia_user_id)
-            .fetch_all(&mut tx)
-            .await
-            .map_err(SqlxError)?;
-
-    let mut response_list = Vec::new();
-    for isu in isu_list {
-        let last_condition: Option<IsuCondition> = fetch_optional_as(
-            sqlx::query_as(
-                "SELECT * FROM `isu_condition` WHERE `jia_isu_uuid` = ? ORDER BY `timestamp` DESC LIMIT 1"
-            ).bind(&isu.jia_isu_uuid),
-            &mut tx
-        )
-        .await
-        .map_err(SqlxError)?;
-
-        let formatted_condition = if let Some(last_condition) = last_condition {
-            let condition_level = calculate_condition_level(&last_condition.condition);
-            if condition_level.is_none() {
-                log::error!("unexpected warn count");
-                return Err(actix_web::error::ErrorInternalServerError(""));
-            }
-            let condition_level = condition_level.unwrap();
-            Some(GetIsuConditionResponse {
-                jia_isu_uuid: last_condition.jia_isu_uuid,
-                isu_name: isu.name.clone(),
-                timestamp: last_condition.timestamp.timestamp(),
-                is_sitting: last_condition.is_sitting,
-                condition: last_condition.condition,
-                condition_level,
-                message: last_condition.message,
-            })
-        } else {
-            None
-        };
-        response_list.push(GetIsuListResponse {
-            id: isu.id,
-            jia_isu_uuid: isu.jia_isu_uuid,
-            name: isu.name,
-            character: isu.character,
-            latest_isu_condition: formatted_condition,
-        });
-    }
-
-    tx.commit().await.map_err(SqlxError)?;
-
-    Ok(HttpResponse::Ok().json(response_list))
-}
-
-// ISUを登録
-#[actix_web::post("/api/isu")]
-async fn post_isu(
-    pool: web::Data<sqlx::MySqlPool>,
-    session: actix_session::Session,
-    mut payload: actix_multipart::Multipart,
-) -> actix_web::Result<HttpResponse> {
-    let jia_user_id = require_signed_in(pool.as_ref(), session).await?;
-
-    let mut jia_isu_uuid = None;
-    let mut isu_name = None;
-    let mut image = None;
-    while let Some(field) = payload.next().await {
-        let field = field.map_err(|_| actix_web::error::ErrorBadRequest("bad format: icon"))?;
-        let content_disposition = field.content_disposition().unwrap();
-        let content = field
-            .map_ok(|chunk| bytes::BytesMut::from(&chunk[..]))
-            .try_concat()
-            .await
-            .map_err(|_| actix_web::error::ErrorBadRequest("bad format: icon"))?
-            .freeze();
-        match content_disposition.get_name().unwrap() {
-            "jia_isu_uuid" => {
-                jia_isu_uuid = Some(String::from_utf8_lossy(&content).into_owned());
-            }
-            "isu_name" => {
-                isu_name = Some(String::from_utf8_lossy(&content).into_owned());
-            }
-            "image" => {
-                image = Some(content);
-            }
-            _ => {}
-        }
-    }
-    let jia_isu_uuid: String = jia_isu_uuid.unwrap_or_default();
-    let isu_name: String = isu_name.unwrap_or_default();
-    let image = match image {
-        Some(image) => image,
-        None => {
-            let content = tokio::fs::read(DEFAULT_ICON_FILE_PATH).await.map_err(|e| {
-                log::error!("{}", e);
-                e
-            })?;
-            bytes::Bytes::from(content)
-        }
-    };
-
-    let mut tx = pool.begin().await.map_err(SqlxError)?;
-
-    let result = sqlx::query(
-        "INSERT INTO `isu` (`jia_isu_uuid`, `name`, `image`, `jia_user_id`) VALUES (?, ?, ?, ?)",
-    )
-    .bind(&jia_isu_uuid)
-    .bind(&isu_name)
-    .bind(image.as_ref())
-    .bind(&jia_user_id)
-    .execute(&mut tx)
-    .await;
-    if let Err(sqlx::Error::Database(ref db_error)) = result {
-        if let Some(mysql_error) = db_error.try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>() {
-            if mysql_error.number() == MYSQL_ERR_NUM_DUPLICATE_ENTRY {
-                return Err(actix_web::error::ErrorConflict("duplicated: isu"));
-            }
-        }
-    }
-    result.map_err(SqlxError)?;
-
-    let target_url = format!(
-        "{}/api/activate",
-        get_jia_service_url(&mut tx).await.map_err(SqlxError)?
+    let token = jsonwebtoken::decode::<Claims>(
+        token_str,
+        &key,
+        &jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256),
     );
-    let body = JIAServiceRequest {
-        target_base_url: &POST_ISUCONDITION_TARGET_BASE_URL,
-        isu_uuid: &jia_isu_uuid,
-    };
+    if let Err(e) = token {
+        return Err(Error::Custom(
+            StatusCode::UNAUTHORIZED,
+            format!("error jsonwebtoken::decode: {}", e).into(),
+        ));
+    }
+    let token = token.unwrap();
 
-    let resp = reqwest::Client::new()
-        .post(&target_url)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| {
-            log::error!("failed to request to JIAService: {}", e);
-            ReqwestError(e)
-        })?;
-
-    let status = resp.status();
-    if status != reqwest::StatusCode::ACCEPTED {
-        let body = resp.text().await.map_err(|e| {
-            log::error!("{}", e);
-            ReqwestError(e)
-        })?;
-        log::error!(
-            "JIAService returned error: status code {}, message: {}",
-            status,
-            body
-        );
-        return Err(
-            actix_web::error::InternalError::new("JIAService returned error", status).into(),
-        );
+    if token.claims.sub.is_none() {
+        return Err(Error::Custom(
+            StatusCode::UNAUTHORIZED,
+            format!(
+                "invalid token: subject is not found in token: {}",
+                token_str
+            )
+            .into(),
+        ));
     }
 
-    let isu_from_jia: IsuFromJIA = resp.json().await.map_err(|e| {
-        log::error!("error occured while reading JIA response: {}", e);
-        ReqwestError(e)
-    })?;
-
-    sqlx::query("UPDATE `isu` SET `character` = ? WHERE  `jia_isu_uuid` = ?")
-        .bind(&isu_from_jia.character)
-        .bind(&jia_isu_uuid)
-        .execute(&mut tx)
-        .await
-        .map_err(SqlxError)?;
-
-    let isu: Isu = fetch_one_as(
-        sqlx::query_as("SELECT * FROM `isu` WHERE `jia_user_id` = ? AND `jia_isu_uuid` = ?")
-            .bind(&jia_user_id)
-            .bind(&jia_isu_uuid),
-        &mut tx,
-    )
-    .await
-    .map_err(SqlxError)?;
-
-    tx.commit().await.map_err(SqlxError)?;
-
-    Ok(HttpResponse::Created().json(isu))
-}
-
-// ISUの情報を取得
-#[actix_web::get("/api/isu/{jia_isu_uuid}")]
-async fn get_isu_id(
-    pool: web::Data<sqlx::MySqlPool>,
-    session: actix_session::Session,
-    jia_isu_uuid: web::Path<String>,
-) -> actix_web::Result<HttpResponse> {
-    let jia_user_id = require_signed_in(pool.as_ref(), session).await?;
-
-    let isu: Option<Isu> =
-        sqlx::query_as("SELECT * FROM `isu` WHERE `jia_user_id` = ? AND `jia_isu_uuid` = ?")
-            .bind(&jia_user_id)
-            .bind(jia_isu_uuid.as_ref())
-            .fetch_optional(pool.as_ref())
-            .await
-            .map_err(SqlxError)?;
-    if isu.is_none() {
-        return Err(actix_web::error::ErrorNotFound("not found: isu"));
+    if token.claims.role.is_none() {
+        return Err(Error::Custom(
+            StatusCode::UNAUTHORIZED,
+            format!("invalid token: role is not found: {}", token_str).into(),
+        ));
     }
-    let isu = isu.unwrap();
-
-    Ok(HttpResponse::Ok().json(isu))
-}
-
-// ISUのアイコンを取得
-#[actix_web::get("/api/isu/{jia_isu_uuid}/icon")]
-async fn get_isu_icon(
-    pool: web::Data<sqlx::MySqlPool>,
-    session: actix_session::Session,
-    jia_isu_uuid: web::Path<String>,
-) -> actix_web::Result<HttpResponse> {
-    let jia_user_id = require_signed_in(pool.as_ref(), session).await?;
-
-    let image: Option<Vec<u8>> = sqlx::query_scalar(
-        "SELECT `image` FROM `isu` WHERE `jia_user_id` = ? AND `jia_isu_uuid` = ?",
-    )
-    .bind(&jia_user_id)
-    .bind(jia_isu_uuid.as_ref())
-    .fetch_optional(pool.as_ref())
-    .await
-    .map_err(SqlxError)?;
-
-    if let Some(image) = image {
-        Ok(HttpResponse::Ok().body(image))
-    } else {
-        Err(actix_web::error::ErrorNotFound("not found: isu"))
-    }
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct GetIsuGraphQuery {
-    datetime: Option<String>,
-}
-
-// ISUのコンディショングラフ描画のための情報を取得
-#[actix_web::get("/api/isu/{jia_isu_uuid}/graph")]
-async fn get_isu_graph(
-    pool: web::Data<sqlx::MySqlPool>,
-    session: actix_session::Session,
-    jia_isu_uuid: web::Path<String>,
-    query: web::Query<GetIsuGraphQuery>,
-) -> actix_web::Result<HttpResponse> {
-    let jia_user_id = require_signed_in(pool.as_ref(), session).await?;
-
-    let date = match &query.datetime {
-        Some(datetime_str) => match datetime_str.parse() {
-            Ok(datetime) => {
-                DateTime::from_utc(NaiveDateTime::from_timestamp(datetime, 0), JST_OFFSET.fix())
-                    .duration_trunc(chrono::Duration::hours(1))
-                    .unwrap()
-            }
-            Err(_) => {
-                return Err(actix_web::error::ErrorBadRequest("bad format: datetime"));
-            }
-        },
-        None => {
-            return Err(actix_web::error::ErrorBadRequest("missing: datetime"));
-        }
-    };
-
-    let mut tx = pool.begin().await.map_err(SqlxError)?;
-
-    let count: i64 = fetch_one_scalar(
-        sqlx::query_scalar(
-            "SELECT COUNT(*) FROM `isu` WHERE `jia_user_id` = ? AND `jia_isu_uuid` = ?",
-        )
-        .bind(&jia_user_id)
-        .bind(jia_isu_uuid.as_ref()),
-        &mut tx,
-    )
-    .await
-    .map_err(SqlxError)?;
-    if count == 0 {
-        return Err(actix_web::error::ErrorNotFound("not found: isu"));
-    }
-
-    let res = generate_isu_graph_response(&mut tx, &jia_isu_uuid, date).await?;
-
-    tx.commit().await.map_err(SqlxError)?;
-
-    Ok(HttpResponse::Ok().json(res))
-}
-
-// グラフのデータ点を一日分生成
-async fn generate_isu_graph_response(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
-    jia_isu_uuid: &str,
-    graph_date: DateTime<chrono::FixedOffset>,
-) -> actix_web::Result<Vec<GraphResponse>> {
-    let mut data_points = Vec::new();
-    let mut conditions_in_this_hour = Vec::new();
-    let mut timestamps_in_this_hour = Vec::new();
-    let mut start_time_in_this_hour =
-        DateTime::from_utc(NaiveDateTime::from_timestamp(0, 0), JST_OFFSET.fix());
-
-    let mut rows = sqlx::query_as(
-        "SELECT * FROM `isu_condition` WHERE `jia_isu_uuid` = ? ORDER BY `timestamp` ASC",
-    )
-    .bind(jia_isu_uuid)
-    .fetch(tx);
-
-    while let Some(row) = rows.next().await {
-        let condition: IsuCondition = row.map_err(SqlxError)?;
-
-        let truncated_condition_time = condition
-            .timestamp
-            .duration_trunc(chrono::Duration::hours(1))
-            .unwrap();
-        if truncated_condition_time != start_time_in_this_hour {
-            if !conditions_in_this_hour.is_empty() {
-                let data = calculate_graph_data_point(&conditions_in_this_hour)?;
-                data_points.push(GraphDataPointWithInfo {
-                    jia_isu_uuid: jia_isu_uuid.to_owned(),
-                    start_at: start_time_in_this_hour,
-                    data,
-                    condition_timestamps: timestamps_in_this_hour,
-                });
-            }
-
-            start_time_in_this_hour = truncated_condition_time;
-            conditions_in_this_hour = Vec::new();
-            timestamps_in_this_hour = Vec::new();
-        }
-        timestamps_in_this_hour.push(condition.timestamp.timestamp());
-        conditions_in_this_hour.push(condition);
-    }
-
-    if !conditions_in_this_hour.is_empty() {
-        let data = calculate_graph_data_point(&conditions_in_this_hour)?;
-        data_points.push(GraphDataPointWithInfo {
-            jia_isu_uuid: jia_isu_uuid.to_owned(),
-            start_at: start_time_in_this_hour,
-            data,
-            condition_timestamps: timestamps_in_this_hour,
-        });
-    }
-
-    let end_time = graph_date + chrono::Duration::hours(24);
-    let mut filtered_data_points = data_points
-        .into_iter()
-        .skip_while(|graph| graph.start_at < graph_date)
-        .take_while(|graph| graph.start_at < end_time)
-        .peekable();
-
-    let mut response_list = Vec::new();
-    let mut this_time = graph_date;
-
-    while this_time < end_time {
-        let (data, timestamps) = filtered_data_points
-            .next_if(|data_with_info| data_with_info.start_at == this_time)
-            .map(|data_with_info| {
-                (
-                    Some(data_with_info.data),
-                    data_with_info.condition_timestamps,
-                )
-            })
-            .unwrap_or_else(|| (None, Vec::new()));
-
-        let resp = GraphResponse {
-            start_at: this_time.timestamp(),
-            end_at: (this_time + chrono::Duration::hours(1)).timestamp(),
-            data,
-            condition_timestamps: timestamps,
-        };
-        response_list.push(resp);
-
-        this_time = this_time + chrono::Duration::hours(1);
-    }
-
-    Ok(response_list)
-}
-
-// 複数のISUのコンディションからグラフの一つのデータ点を計算
-fn calculate_graph_data_point(
-    isu_conditions: &[IsuCondition],
-) -> actix_web::Result<GraphDataPoint> {
-    use std::iter::FromIterator as _;
-
-    let mut conditions_count: HashMap<&str, i64> =
-        HashMap::from_iter([("is_broken", 0), ("is_dirty", 0), ("is_overweight", 0)]);
-    let mut raw_score = 0;
-    for condition in isu_conditions {
-        if !is_valid_condition_format(&condition.condition) {
-            return Err(actix_web::error::ErrorInternalServerError(
-                "invalid condition format",
+    let tr = token.claims.role.unwrap();
+    let role = match tr.as_str() {
+        ROLE_ADMIN | ROLE_ORGANIZER | ROLE_PLAYER => tr,
+        _ => {
+            return Err(Error::Custom(
+                StatusCode::UNAUTHORIZED,
+                format!("invalid token: invalid role: {}", token_str).into(),
             ));
         }
-
-        let conditions = condition
-            .condition
-            .split(',')
-            .map(|cond_str| {
-                let mut key_value = cond_str.split('=');
-                (key_value.next().unwrap(), key_value.next().unwrap())
-            })
-            .filter(|(_, value)| *value == "true")
-            .map(|(condition_name, _)| condition_name);
-        let mut bad_conditions_count = 0;
-        for condition_name in conditions {
-            bad_conditions_count += 1;
-            *conditions_count.get_mut(&condition_name).unwrap() += 1;
-        }
-
-        if bad_conditions_count >= 3 {
-            raw_score += SCORE_CONDITION_LEVEL_CRITICAL;
-        } else if bad_conditions_count >= 1 {
-            raw_score += SCORE_CONDITION_LEVEL_WARNING;
-        } else {
-            raw_score += SCORE_CONDITION_LEVEL_INFO;
-        }
+    };
+    // aud は1要素でテナント名がはいっている
+    let aud = token.claims.aud;
+    if aud.len() != 1 {
+        return Err(Error::Custom(
+            StatusCode::UNAUTHORIZED,
+            format!("invalid token: aud filed is few or too much: {}", token_str).into(),
+        ));
+    }
+    let tenant = retrieve_tenant_row_from_header(admin_db, &request).await?;
+    if tenant.is_none() {
+        return Err(Error::Custom(
+            StatusCode::UNAUTHORIZED,
+            "tenant not found".into(),
+        ));
+    }
+    let tenant = tenant.unwrap();
+    if tenant.name == "admin" && role != ROLE_ADMIN {
+        return Err(Error::Custom(
+            StatusCode::UNAUTHORIZED,
+            "tenant not found".into(),
+        ));
     }
 
-    let sitting_count = isu_conditions
-        .iter()
-        .filter(|condition| condition.is_sitting)
-        .count() as i64;
+    if tenant.name != aud[0] {
+        return Err(Error::Custom(
+            StatusCode::UNAUTHORIZED,
+            format!("invalid token: tenant name is not match: {}", token_str).into(),
+        ));
+    }
 
-    let isu_conditions_length = isu_conditions.len() as i64;
-    let score = raw_score * 100 / 3 / isu_conditions_length;
-
-    let sitting_percentage = sitting_count * 100 / isu_conditions_length;
-    let is_broken_percentage =
-        conditions_count.get("is_broken").unwrap() * 100 / isu_conditions_length;
-    let is_overweight_percentage =
-        conditions_count.get("is_overweight").unwrap() * 100 / isu_conditions_length;
-    let is_dirty_percentage =
-        conditions_count.get("is_dirty").unwrap() * 100 / isu_conditions_length;
-
-    Ok(GraphDataPoint {
-        score,
-        percentage: ConditionsPercentage {
-            sitting: sitting_percentage,
-            is_broken: is_broken_percentage,
-            is_overweight: is_overweight_percentage,
-            is_dirty: is_dirty_percentage,
-        },
+    Ok(Viewer {
+        role,
+        player_id: token.claims.sub.unwrap(),
+        tenant_name: tenant.name,
+        tenant_id: tenant.id,
     })
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct GetIsuConditionsQuery {
-    end_time: Option<String>,
-    condition_level: Option<String>,
-    start_time: Option<String>,
+async fn retrieve_tenant_row_from_header(
+    admin_db: &sqlx::MySqlPool,
+    request: &HttpRequest,
+) -> sqlx::Result<Option<TenantRow>> {
+    // JWTに入っているテナント名とHostヘッダのテナント名が一致しているか確認
+    let base_host = get_env("ISUCON_BASE_HOSTNAME", ".t.isucon.local");
+    let tenant_name = {
+        // await_holding_refcell_ref を避けるために tenant_name を String にしておく
+        // https://rust-lang.github.io/rust-clippy/master/index.html#await_holding_refcell_ref
+        let conn_info = request.connection_info();
+        conn_info.host().trim_end_matches(&base_host).to_owned()
+    };
+
+    // SaaS管理者用ドメイン
+    if tenant_name == "admin" {
+        return Ok(Some(TenantRow {
+            name: "admin".to_string(),
+            display_name: "admin".to_string(),
+            id: 0,
+            created_at: 0,
+            updated_at: 0,
+        }));
+    }
+    // テナントの存在確認
+    sqlx::query_as("SELECT * FROM tenant WHERE name = ?")
+        .bind(tenant_name)
+        .fetch_optional(admin_db)
+        .await
 }
 
-// ISUのコンディションを取得
-#[actix_web::get("/api/condition/{jia_isu_uuid}")]
-async fn get_isu_conditions(
-    pool: web::Data<sqlx::MySqlPool>,
-    session: actix_session::Session,
-    jia_isu_uuid: web::Path<String>,
-    query: web::Query<GetIsuConditionsQuery>,
-) -> actix_web::Result<HttpResponse> {
-    let jia_user_id = require_signed_in(pool.as_ref(), session).await?;
+#[derive(Debug, sqlx::FromRow)]
+struct TenantRow {
+    id: i64,
+    name: String,
+    display_name: String,
+    created_at: i64,
+    updated_at: i64,
+}
 
-    if jia_isu_uuid.is_empty() {
-        return Err(actix_web::error::ErrorBadRequest("missing: jia_isu_uuid"));
-    }
-    let end_time = match &query.end_time {
-        Some(end_time_str) => match end_time_str.parse() {
-            Ok(end_time) => {
-                DateTime::from_utc(NaiveDateTime::from_timestamp(end_time, 0), JST_OFFSET.fix())
-            }
-            Err(_) => {
-                return Err(actix_web::error::ErrorBadRequest("bad format: end_time"));
-            }
-        },
+#[derive(Debug, sqlx::FromRow)]
+struct PlayerRow {
+    tenant_id: i64,
+    id: String,
+    display_name: String,
+    is_disqualified: bool,
+    created_at: i64,
+    updated_at: i64,
+}
+
+// 参加者を取得する
+async fn retrieve_player(
+    tenant_db: &mut SqliteConnection,
+    id: &str,
+) -> sqlx::Result<Option<PlayerRow>> {
+    sqlx::query_as("SELECT * FROM player WHERE id = ?")
+        .bind(id)
+        .fetch_optional(tenant_db)
+        .await
+}
+
+// 参加者を認可する
+// 参加者向けAPIで呼ばれる
+async fn authorize_player(tenant_db: &mut SqliteConnection, id: &str) -> Result<(), Error> {
+    let player = match retrieve_player(tenant_db, id).await? {
+        Some(player) => player,
         None => {
-            return Err(actix_web::error::ErrorBadRequest("bad format: end_time"));
+            return Err(Error::Custom(
+                StatusCode::UNAUTHORIZED,
+                "player not found".into(),
+            ));
         }
     };
-    if query.condition_level.is_none() {
-        return Err(actix_web::error::ErrorBadRequest(
-            "missing: condition_level",
+    if player.is_disqualified {
+        return Err(Error::Custom(
+            StatusCode::FORBIDDEN,
+            "player is disqualified".into(),
         ));
     }
-    let mut condition_level = HashSet::new();
-    for level in query.condition_level.as_ref().unwrap().split(',') {
-        condition_level.insert(level);
+    Ok(())
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct CompetitionRow {
+    tenant_id: i64,
+    id: String,
+    title: String,
+    finished_at: Option<i64>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+// 大会を取得する
+async fn retrieve_competition(
+    tenant_db: &mut SqliteConnection,
+    id: &str,
+) -> sqlx::Result<Option<CompetitionRow>> {
+    sqlx::query_as("SELECT * FROM competition WHERE id = ?")
+        .bind(id)
+        .fetch_optional(tenant_db)
+        .await
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct PlayerScoreRow {
+    tenant_id: i64,
+    id: String,
+    player_id: String,
+    competition_id: String,
+    score: i64,
+    row_num: i64,
+    created_at: i64,
+    updated_at: i64,
+}
+
+// 排他ロックのためのファイル名を生成する
+fn lock_file_path(id: i64) -> PathBuf {
+    let tenant_db_dir = get_env("ISUCON_TENANT_DB_DIR", "../tenant_db");
+    PathBuf::from(tenant_db_dir).join(format!("{}.lock", id))
+}
+
+#[derive(Debug)]
+struct Flock {
+    fd: std::os::unix::io::RawFd,
+}
+
+// 排他ロックする
+async fn flock_by_tenant_id(tenant_id: i64) -> Result<Flock, nix::Error> {
+    let p = lock_file_path(tenant_id);
+    let fd = nix::fcntl::open(
+        &p,
+        nix::fcntl::OFlag::O_CREAT | nix::fcntl::OFlag::O_RDONLY,
+        nix::sys::stat::Mode::from_bits_truncate(0o600),
+    )?;
+    tokio::task::spawn_blocking(move || {
+        match nix::fcntl::flock(fd, nix::fcntl::FlockArg::LockExclusive) {
+            Ok(()) => Ok(Flock { fd }),
+            Err(e) => {
+                let _ = nix::unistd::close(fd);
+                Err(e)
+            }
+        }
+    })
+    .await
+    .unwrap()
+}
+
+impl Drop for Flock {
+    fn drop(&mut self) {
+        let _ = nix::unistd::close(self.fd);
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct TenantsAddHandlerResult {
+    tenant: TenantWithBilling,
+}
+
+#[derive(Debug, Deserialize)]
+struct TenantsAddHandlerForm {
+    name: String,
+    display_name: String,
+}
+
+// SaaS管理者用API
+// テナントを追加する
+// POST /api/admin/tenants/add
+async fn tenants_add_handler(
+    admin_db: web::Data<sqlx::MySqlPool>,
+    request: HttpRequest,
+    form: web::Form<TenantsAddHandlerForm>,
+) -> actix_web::Result<HttpResponse, Error> {
+    let form = form.into_inner();
+    let v = parse_viewer(&admin_db, &request).await?;
+    if v.tenant_name != "admin" {
+        // admin: SaaS管理者用の特別なテナント名
+        return Err(Error::Custom(
+            StatusCode::NOT_FOUND,
+            format!("{} has not this API", v.tenant_name).into(),
+        ));
+    }
+    if v.role != ROLE_ADMIN {
+        return Err(Error::Custom(
+            StatusCode::FORBIDDEN,
+            "admin role required".into(),
+        ));
     }
 
-    let start_time = match &query.start_time {
-        Some(start_time_str) => match start_time_str.parse() {
-            Ok(start_time) => Some(DateTime::from_utc(
-                NaiveDateTime::from_timestamp(start_time, 0),
-                JST_OFFSET.fix(),
-            )),
-            Err(_) => {
-                return Err(actix_web::error::ErrorBadRequest("bad format: start_time"));
+    validate_tenant_name(&form.name)?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    let insert_res = sqlx::query(
+        "INSERT INTO tenant (name, display_name, created_at, updated_at) VALUES (?, ?, ?, ?)",
+    )
+    .bind(&form.name)
+    .bind(&form.display_name)
+    .bind(now)
+    .bind(now)
+    .execute(&**admin_db)
+    .await;
+    if let Err(e) = insert_res {
+        if let Some(database_error) = e.as_database_error() {
+            if let Some(merr) = database_error.try_downcast_ref::<MySqlDatabaseError>() {
+                if merr.number() == 1062 {
+                    // duplicate entry
+                    return Err(Error::Custom(
+                        StatusCode::BAD_REQUEST,
+                        "duplicate tenant".into(),
+                    ));
+                }
             }
+        }
+        return Err(e.into());
+    }
+
+    let id = insert_res.unwrap().last_insert_id();
+    // NOTE: 先にadminDBに書き込まれることでこのAPIの処理中に
+    //       /api/admin/tenants/billingにアクセスされるとエラーになりそう
+    //       ロックなどで対処したほうが良さそう
+    create_tenant_db(id as i64).await?;
+    let res = TenantsAddHandlerResult {
+        tenant: TenantWithBilling {
+            id: id.to_string(),
+            name: form.name,
+            display_name: form.display_name,
+            billing_yen: 0,
         },
-        None => None,
+    };
+    Ok(HttpResponse::Ok().json(SuccessResult {
+        status: true,
+        data: res,
+    }))
+}
+
+// テナント名が規則に沿っているかチェックする
+fn validate_tenant_name(name: &str) -> Result<(), Error> {
+    if TENANT_NAME_REGEXP.is_match(name) {
+        Ok(())
+    } else {
+        Err(Error::Custom(
+            StatusCode::BAD_REQUEST,
+            format!("invalid tenant name: {}", name).into(),
+        ))
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct BillingReport {
+    competition_id: String,
+    competition_title: String,
+    player_count: i64,        // スコアを登録した参加者数
+    visitor_count: i64,       // ランキングを閲覧だけした(スコアを登録していない)参加者数
+    billing_player_yen: i64,  // 請求金額 スコアを登録した参加者分
+    billing_visitor_yen: i64, // 請求金額 ランキングを閲覧だけした(スコアを登録していない)参加者分
+    billing_yen: i64,         // 合計請求金額
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct VisitHistorySummaryRow {
+    player_id: String,
+    min_created_at: i64,
+}
+
+// 大会ごとの課金レポートを計算する
+async fn billing_report_by_competition(
+    admin_db: &sqlx::MySqlPool,
+    tenant_db: &mut SqliteConnection,
+    tenant_id: i64,
+    competition_id: &str,
+) -> Result<BillingReport, Error> {
+    let comp = retrieve_competition(tenant_db, competition_id).await?;
+    if comp.is_none() {
+        return Err(Error::Internal("error retrieve_competition".into()));
+    }
+    let comp = comp.unwrap();
+    let vhs: Vec<VisitHistorySummaryRow> = sqlx::query_as("SELECT player_id, MIN(created_at) AS min_created_at FROM visit_history WHERE tenant_id = ? AND competition_id = ? GROUP BY player_id")
+        .bind(tenant_id)
+        .bind(&comp.id)
+        .fetch_all(admin_db)
+        .await?;
+
+    let mut billing_map = HashMap::new();
+    for vh in vhs {
+        // competition.finished_atよりもあとの場合は、終了後に訪問したとみなして大会開催内アクセス済みとみなさない
+        if comp.finished_at.is_some() && comp.finished_at.unwrap() < vh.min_created_at {
+            continue;
+        }
+        billing_map.insert(vh.player_id, "visitor");
+    }
+
+    // player_scoreを読んでいる時に更新が走ると不整合が起こるのでロックを取得する
+    let _fl = flock_by_tenant_id(tenant_id).await?;
+
+    // スコアを登録した参加者のIDを取得する
+    sqlx::query_as(
+        "SELECT DISTINCT(player_id) FROM player_score WHERE tenant_id = ? AND competition_id = ?",
+    )
+    .bind(tenant_id)
+    .bind(&comp.id)
+    .fetch_all(tenant_db)
+    .await?
+    .into_iter()
+    .for_each(|(ps,): (String,)| {
+        // スコアが登録されている参加者
+        billing_map.insert(ps, "player");
+    });
+
+    // 大会が終了している場合のみ請求金額が確定するので計算する
+    let mut player_count = 0;
+    let mut visitor_count = 0;
+    if comp.finished_at.is_some() {
+        for (_, category) in billing_map {
+            if category == "player" {
+                player_count += 1;
+            } else if category == "visitor" {
+                visitor_count += 1;
+            }
+        }
+    }
+    Ok(BillingReport {
+        competition_id: comp.id,
+        competition_title: comp.title,
+        player_count,
+        visitor_count,
+        billing_player_yen: 100 * player_count, // スコアを登録した参加者は100円
+        billing_visitor_yen: 10 * visitor_count, // ランキングを閲覧だけした(スコアを登録していない)参加者は10円
+        billing_yen: 100 * player_count + 10 * visitor_count,
+    })
+}
+
+#[derive(Debug, Serialize)]
+struct TenantWithBilling {
+    id: String,
+    name: String,
+    display_name: String,
+    #[serde(rename = "billing")]
+    billing_yen: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct TenantsBillingHandlerResult {
+    tenants: Vec<TenantWithBilling>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TenantsBillingHandlerQuery {
+    before: Option<i64>,
+}
+
+// SaaS管理者用API
+// テナントごとの課金レポートを最大10件、テナントのid降順で取得する
+// GET /api/admin/tenants/billing
+// URL引数beforeを指定した場合、指定した値よりもidが小さいテナントの課金レポートを取得する
+async fn tenants_billing_handler(
+    admin_db: web::Data<sqlx::MySqlPool>,
+    request: HttpRequest,
+    query: web::Query<TenantsBillingHandlerQuery>,
+    conn: actix_web::dev::ConnectionInfo,
+) -> actix_web::Result<HttpResponse, Error> {
+    if conn.host() != get_env("ISUCON_ADMIN_HOSTNAME", "admin.t.isucon.local") {
+        return Err(Error::Custom(
+            StatusCode::NOT_FOUND,
+            format!("invalid hostname {}", conn.host()).into(),
+        ));
     };
 
-    let isu_name: Option<String> =
-        sqlx::query_scalar("SELECT name FROM `isu` WHERE `jia_isu_uuid` = ? AND `jia_user_id` = ?")
-            .bind(jia_isu_uuid.as_ref())
-            .bind(&jia_user_id)
-            .fetch_optional(pool.as_ref())
-            .await
-            .map_err(SqlxError)?;
-    if isu_name.is_none() {
-        log::error!("isu not found");
-        return Err(actix_web::error::ErrorNotFound("not found: isu"));
-    }
-    let isu_name = isu_name.unwrap();
+    let v = parse_viewer(&admin_db, &request).await?;
+    if v.role != ROLE_ADMIN {
+        return Err(Error::Custom(
+            StatusCode::FORBIDDEN,
+            "admin role required".into(),
+        ));
+    };
 
-    let conditions_response = get_isu_conditions_from_db(
-        &pool,
-        &jia_isu_uuid,
-        end_time,
-        &condition_level,
-        &start_time,
-        CONDITION_LIMIT,
-        &isu_name,
-    )
-    .await
-    .map_err(SqlxError)?;
+    let before_id = query.before.unwrap_or(0);
+    // テナントごとに
+    //   大会ごとに
+    //     scoreが登録されているplayer * 100
+    //     scoreが登録されていないplayerでアクセスした人 * 10
+    //   を合計したものを
+    // テナントの課金とする
+    let ts: Vec<TenantRow> = sqlx::query_as("SELECT * FROM tenant ORDER BY id DESC")
+        .fetch_all(&**admin_db)
+        .await?;
 
-    Ok(HttpResponse::Ok().json(conditions_response))
-}
+    let mut tenant_billings = Vec::with_capacity(ts.len());
+    for t in ts {
+        if before_id != 0 && before_id <= t.id {
+            continue;
+        }
+        let mut tb = TenantWithBilling {
+            id: t.id.to_string(),
+            name: t.name,
+            display_name: t.display_name,
+            billing_yen: 0,
+        };
+        let mut tenant_db = connect_to_tenant_db(t.id).await?;
+        let cs: Vec<CompetitionRow> = sqlx::query_as("SELECT * FROM competition WHERE tenant_id=?")
+            .bind(t.id)
+            .fetch_all(&mut tenant_db)
+            .await?;
+        for comp in cs {
+            let report =
+                billing_report_by_competition(&admin_db, &mut tenant_db, t.id, &comp.id).await?;
+            tb.billing_yen += report.billing_yen;
+        }
+        tenant_billings.push(tb);
 
-async fn get_isu_conditions_from_db(
-    pool: &sqlx::MySqlPool,
-    jia_isu_uuid: &str,
-    end_time: DateTime<chrono::FixedOffset>,
-    condition_level: &HashSet<&str>,
-    start_time: &Option<DateTime<chrono::FixedOffset>>,
-    limit: usize,
-    isu_name: &str,
-) -> sqlx::Result<Vec<GetIsuConditionResponse>> {
-    let conditions: Vec<IsuCondition> = if let Some(ref start_time) = start_time {
-        sqlx::query_as(
-            "SELECT * FROM `isu_condition` WHERE `jia_isu_uuid` = ? AND `timestamp` < ?	AND ? <= `timestamp` ORDER BY `timestamp` DESC",
-        )
-            .bind(jia_isu_uuid)
-            .bind(end_time.naive_local())
-            .bind(start_time.naive_local())
-            .fetch_all(pool)
-    } else {
-        sqlx::query_as(
-            "SELECT * FROM `isu_condition` WHERE `jia_isu_uuid` = ? AND `timestamp` < ? ORDER BY `timestamp` DESC",
-        )
-        .bind(jia_isu_uuid)
-        .bind(end_time.naive_local())
-        .fetch_all(pool)
-    }.await?;
-
-    let mut conditions_response = Vec::new();
-    for c in conditions {
-        if let Some(c_level) = calculate_condition_level(&c.condition) {
-            if condition_level.contains(c_level) {
-                conditions_response.push(GetIsuConditionResponse {
-                    jia_isu_uuid: c.jia_isu_uuid,
-                    isu_name: isu_name.to_owned(),
-                    timestamp: c.timestamp.timestamp(),
-                    is_sitting: c.is_sitting,
-                    condition: c.condition,
-                    condition_level: c_level,
-                    message: c.message,
-                });
-            }
+        if tenant_billings.len() >= 10 {
+            break;
         }
     }
-
-    if conditions_response.len() > limit {
-        conditions_response.truncate(limit);
-    }
-
-    Ok(conditions_response)
+    Ok(HttpResponse::Ok().json(SuccessResult {
+        status: true,
+        data: TenantsBillingHandlerResult {
+            tenants: tenant_billings,
+        },
+    }))
 }
 
-// ISUのコンディションの文字列からコンディションレベルを計算
-fn calculate_condition_level(condition: &str) -> Option<&'static str> {
-    let warn_count = condition.matches("=true").count();
-    match warn_count {
-        0 => Some(CONDITION_LEVEL_INFO),
-        1 | 2 => Some(CONDITION_LEVEL_WARNING),
-        3 => Some(CONDITION_LEVEL_CRITICAL),
-        _ => None,
-    }
+#[derive(Debug, Serialize)]
+struct PlayerDetail {
+    id: String,
+    display_name: String,
+    is_disqualified: bool,
 }
 
-// ISUの性格毎の最新のコンディション情報
-#[actix_web::get("/api/trend")]
-async fn get_trend(pool: web::Data<sqlx::MySqlPool>) -> actix_web::Result<HttpResponse> {
-    let character_list: Vec<String> =
-        sqlx::query_scalar("SELECT `character` FROM `isu` GROUP BY `character`")
-            .fetch_all(pool.as_ref())
-            .await
-            .map_err(SqlxError)?;
+#[derive(Debug, Serialize)]
+struct PlayersListHandlerResult {
+    players: Vec<PlayerDetail>,
+}
 
-    let mut res = Vec::new();
+// テナント管理者向けAPI
+// GET /api/organizer/players
+// 参加者一覧を返す
+async fn players_list_handler(
+    admin_db: web::Data<sqlx::MySqlPool>,
+    request: actix_web::HttpRequest,
+) -> actix_web::Result<HttpResponse, Error> {
+    let v = parse_viewer(&admin_db, &request).await?;
+    if v.role != ROLE_ORGANIZER {
+        return Err(Error::Custom(
+            StatusCode::FORBIDDEN,
+            "role organizer required".into(),
+        ));
+    };
 
-    for character in character_list {
-        let isu_list: Vec<Isu> = sqlx::query_as("SELECT * FROM `isu` WHERE `character` = ?")
-            .bind(&character)
-            .fetch_all(pool.as_ref())
-            .await
-            .map_err(SqlxError)?;
+    let mut tenant_db = connect_to_tenant_db(v.tenant_id).await?;
 
-        let mut character_info_isu_conditions = Vec::new();
-        let mut character_warning_isu_conditions = Vec::new();
-        let mut character_critical_isu_conditions = Vec::new();
-        for isu in isu_list {
-            let conditions: Vec<IsuCondition> = sqlx::query_as(
-                "SELECT * FROM `isu_condition` WHERE `jia_isu_uuid` = ? ORDER BY timestamp DESC",
-            )
-            .bind(&isu.jia_isu_uuid)
-            .fetch_all(pool.as_ref())
-            .await
-            .map_err(SqlxError)?;
-
-            if !conditions.is_empty() {
-                let isu_last_condition = &conditions[0];
-                let condition_level = calculate_condition_level(&isu_last_condition.condition);
-                if condition_level.is_none() {
-                    log::error!("unexpected warn count");
-                    return Err(actix_web::error::ErrorInternalServerError(""));
-                }
-                let condition_level = condition_level.unwrap();
-                let trend_condition = TrendCondition {
-                    id: isu.id,
-                    timestamp: isu_last_condition.timestamp.timestamp(),
-                };
-                match condition_level {
-                    "info" => character_info_isu_conditions.push(trend_condition),
-                    "warning" => character_warning_isu_conditions.push(trend_condition),
-                    "critical" => character_critical_isu_conditions.push(trend_condition),
-                    _ => {}
-                };
-            }
-        }
-
-        character_info_isu_conditions
-            .sort_by_key(|condition| std::cmp::Reverse(condition.timestamp));
-        character_warning_isu_conditions
-            .sort_by_key(|condition| std::cmp::Reverse(condition.timestamp));
-        character_critical_isu_conditions
-            .sort_by_key(|condition| std::cmp::Reverse(condition.timestamp));
-        res.push(TrendResponse {
-            character,
-            info: character_info_isu_conditions,
-            warning: character_warning_isu_conditions,
-            critical: character_critical_isu_conditions,
+    let pls: Vec<PlayerRow> =
+        sqlx::query_as("SELECT * FROM player WHERE tenant_id=? ORDER BY created_at DESC")
+            .bind(v.tenant_id)
+            .fetch_all(&mut tenant_db)
+            .await?;
+    let mut pds = Vec::new();
+    for p in pls {
+        pds.push(PlayerDetail {
+            id: p.id,
+            display_name: p.display_name,
+            is_disqualified: p.is_disqualified,
         });
     }
+    let res = PlayersListHandlerResult { players: pds };
+    Ok(HttpResponse::Ok().json(SuccessResult {
+        status: true,
+        data: res,
+    }))
+}
+
+#[derive(Debug, Serialize)]
+struct PlayersAddHandlerResult {
+    players: Vec<PlayerDetail>,
+}
+
+// テナント管理者向けAPI
+// GET /api/organizer/players/add
+// テナントに参加者を追加する
+async fn players_add_handler(
+    admin_db: web::Data<sqlx::MySqlPool>,
+    request: HttpRequest,
+    form_param: web::Form<Vec<(String, String)>>,
+) -> actix_web::Result<HttpResponse, Error> {
+    let v = parse_viewer(&admin_db, &request).await?;
+    if v.role != ROLE_ORGANIZER {
+        return Err(Error::Custom(
+            StatusCode::FORBIDDEN,
+            "role organizer required".into(),
+        ));
+    };
+
+    let mut tenant_db = connect_to_tenant_db(v.tenant_id).await?;
+
+    let display_names = form_param
+        .into_inner()
+        .into_iter()
+        .filter_map(|(key, val)| (key == "display_name[]").then(|| val));
+
+    let mut pds = Vec::new();
+    for display_name in display_names {
+        let id = dispense_id(&admin_db).await?;
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        sqlx::query("INSERT INTO player (id, tenant_id, display_name, is_disqualified, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)")
+            .bind(&id)
+            .bind(v.tenant_id)
+            .bind(display_name)
+            .bind(false)
+            .bind(now)
+            .bind(now)
+            .execute(&mut tenant_db)
+            .await?;
+        let p = retrieve_player(&mut tenant_db, &id).await?;
+        if p.is_none() {
+            return Err(Error::Internal("error retrieve_player".into()));
+        }
+        let p = p.unwrap();
+        pds.push(PlayerDetail {
+            id: p.id,
+            display_name: p.display_name,
+            is_disqualified: p.is_disqualified,
+        });
+    }
+
+    let res = PlayersAddHandlerResult { players: pds };
+    Ok(HttpResponse::Ok().json(SuccessResult {
+        status: true,
+        data: res,
+    }))
+}
+
+#[derive(Debug, Serialize)]
+struct PlayerDisqualifiedHandlerResult {
+    player: PlayerDetail,
+}
+
+// テナント管理者向けAPI
+// POST /api/organizer/player/:player_id/disqualified
+// 参加者を失格にする
+async fn player_disqualified_handler(
+    admin_db: web::Data<sqlx::MySqlPool>,
+    request: HttpRequest,
+    params: web::Path<(String,)>,
+) -> actix_web::Result<HttpResponse, Error> {
+    let v = parse_viewer(&admin_db, &request).await?;
+    if v.role != ROLE_ORGANIZER {
+        return Err(Error::Custom(
+            StatusCode::FORBIDDEN,
+            "role organizer required".into(),
+        ));
+    };
+
+    let mut tenant_db = connect_to_tenant_db(v.tenant_id).await?;
+
+    let (player_id,) = params.into_inner();
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    sqlx::query("UPDATE player SET is_disqualified = ?, updated_at=? WHERE id = ?")
+        .bind(true)
+        .bind(now)
+        .bind(&player_id)
+        .execute(&mut tenant_db)
+        .await?;
+    let p = retrieve_player(&mut tenant_db, &player_id).await?;
+    if p.is_none() {
+        // 存在しないプレイヤー
+        return Err(Error::Custom(
+            StatusCode::NOT_FOUND,
+            "player not found".into(),
+        ));
+    }
+    let p = p.unwrap();
+
+    let res = PlayerDisqualifiedHandlerResult {
+        player: PlayerDetail {
+            id: p.id,
+            display_name: p.display_name,
+            is_disqualified: p.is_disqualified,
+        },
+    };
+    Ok(HttpResponse::Ok().json(SuccessResult {
+        status: true,
+        data: res,
+    }))
+}
+
+#[derive(Debug, Serialize)]
+struct CompetitionDetail {
+    id: String,
+    title: String,
+    is_finished: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct CompetitionsAddHandlerResult {
+    competition: CompetitionDetail,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompetitionAddHandlerForm {
+    title: String,
+}
+
+// テナント管理者向けAPI
+// POST /api/organizer/competitions/add
+// 大会を追加する
+async fn competitions_add_handler(
+    admin_db: web::Data<sqlx::MySqlPool>,
+    request: HttpRequest,
+    form: web::Form<CompetitionAddHandlerForm>,
+) -> actix_web::Result<HttpResponse, Error> {
+    let v = parse_viewer(&admin_db, &request).await?;
+    if v.role != ROLE_ORGANIZER {
+        return Err(Error::Custom(
+            StatusCode::FORBIDDEN,
+            "role organizer required".into(),
+        ));
+    };
+
+    let mut tenant_db = connect_to_tenant_db(v.tenant_id).await?;
+
+    let title = form.into_inner().title;
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let id = dispense_id(&admin_db).await?;
+
+    sqlx::query("INSERT INTO competition (id, tenant_id, title, finished_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)")
+        .bind(&id)
+        .bind(v.tenant_id)
+        .bind(&title)
+        .bind(Option::<i64>::None)
+        .bind(now)
+        .bind(now)
+        .execute(&mut tenant_db)
+        .await?;
+
+    let res = CompetitionsAddHandlerResult {
+        competition: CompetitionDetail {
+            id,
+            title,
+            is_finished: false,
+        },
+    };
+    Ok(HttpResponse::Ok().json(SuccessResult {
+        status: true,
+        data: res,
+    }))
+}
+
+// テナント管理者向けAPI
+// POST /api/organizer/competition/:competition_id/finish
+// 大会を終了する
+async fn competition_finish_handler(
+    admin_db: web::Data<sqlx::MySqlPool>,
+    request: HttpRequest,
+    params: web::Path<(String,)>,
+) -> actix_web::Result<HttpResponse, Error> {
+    let v: Viewer = parse_viewer(&admin_db, &request).await?;
+    if v.role != ROLE_ORGANIZER {
+        return Err(Error::Custom(
+            StatusCode::FORBIDDEN,
+            "role organizer required".into(),
+        ));
+    };
+
+    let mut tenant_db = connect_to_tenant_db(v.tenant_id).await?;
+
+    let (id,) = params.into_inner();
+    if retrieve_competition(&mut tenant_db, &id).await?.is_none() {
+        // 存在しない大会
+        return Err(Error::Custom(
+            StatusCode::NOT_FOUND,
+            "competition not found".into(),
+        ));
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    sqlx::query("UPDATE competition SET finished_at = ?, updated_at=? WHERE id = ?")
+        .bind(now)
+        .bind(now)
+        .bind(id)
+        .execute(&mut tenant_db)
+        .await?;
+
+    let res = SuccessResult {
+        status: true,
+        data: (),
+    };
+    Ok(HttpResponse::Ok().json(res))
+}
+
+#[derive(Debug, Serialize)]
+struct ScoreHandlerResult {
+    rows: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompetitionScoreHandlerForm {
+    competition_id: String,
+}
+
+// テナント管理者向けAPI
+// POST /api/organizer/competition/:competition_id/score
+// 大会のスコアをCSVでアップロードする
+async fn competition_score_handler(
+    admin_db: web::Data<sqlx::MySqlPool>,
+    request: HttpRequest,
+    params: web::Path<(String,)>,
+    mut payload: Multipart,
+) -> actix_web::Result<HttpResponse, Error> {
+    let v = parse_viewer(&admin_db, &request).await?;
+    if v.role != ROLE_ORGANIZER {
+        return Err(Error::Custom(
+            StatusCode::FORBIDDEN,
+            "role organizer required".into(),
+        ));
+    };
+
+    let mut tenant_db = connect_to_tenant_db(v.tenant_id).await?;
+
+    let (competition_id,) = params.into_inner();
+    let comp = match retrieve_competition(&mut tenant_db, &competition_id).await? {
+        Some(c) => c,
+        None => {
+            // 存在しない大会
+            return Err(Error::Custom(
+                StatusCode::NOT_FOUND,
+                "competition not found".into(),
+            ));
+        }
+    };
+    if comp.finished_at.is_some() {
+        let res = FailureResult {
+            status: false,
+            message: "competition is finished".to_string(),
+        };
+        return Ok(HttpResponse::BadRequest().json(res));
+    }
+
+    let mut score_bytes: Option<BytesMut> = None;
+    while let Some(item) = payload.next().await {
+        let field = item?;
+        let content_disposition = field.content_disposition();
+        if content_disposition.get_name().unwrap() == "scores" {
+            score_bytes = Some(
+                field
+                    .map_ok(|chunk| BytesMut::from(&chunk[..]))
+                    .try_concat()
+                    .await?,
+            );
+            break;
+        }
+    }
+    if score_bytes.is_none() {
+        return Err(Error::Internal("scores field does not exist".into()));
+    }
+    let score_bytes = score_bytes.unwrap();
+
+    let mut rdr = csv::Reader::from_reader(score_bytes.as_ref());
+    {
+        let headers = rdr.headers()?;
+        if headers != ["player_id", "score"].as_slice() {
+            return Err(Error::Custom(
+                StatusCode::BAD_REQUEST,
+                "invalid CSV headers".into(),
+            ));
+        }
+    }
+
+    // DELETEしたタイミングで参照が来ると空っぽのランキングになるのでロックする
+    let _fl = flock_by_tenant_id(v.tenant_id).await?;
+    let mut player_score_rows = Vec::new();
+    for (row_num, row) in rdr.into_records().enumerate() {
+        let row = row?;
+        if row.len() != 2 {
+            return Err(Error::Internal(
+                format!("row must have tow columns: {:?}", row).into(),
+            ));
+        };
+        let player_id = &row[0];
+        let score_str = &row[1];
+        if retrieve_player(&mut tenant_db, player_id).await?.is_none() {
+            // 存在しない参加者が含まれている
+            return Err(Error::Custom(
+                StatusCode::BAD_REQUEST,
+                format!("player not found: {}", player_id).into(),
+            ));
+        }
+        let score: i64 = match score_str.parse() {
+            Ok(s) => s,
+            Err(e) => {
+                return Err(Error::Custom(
+                    StatusCode::BAD_REQUEST,
+                    format!("error parse: score_str={}, {}", score_str, e).into(),
+                ));
+            }
+        };
+        let id = dispense_id(&admin_db).await?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        player_score_rows.push(PlayerScoreRow {
+            id,
+            tenant_id: v.tenant_id,
+            player_id: player_id.to_owned(),
+            competition_id: competition_id.clone(),
+            score,
+            row_num: row_num as i64,
+            created_at: now,
+            updated_at: now,
+        });
+    }
+
+    sqlx::query("DELETE FROM player_score WHERE tenant_id = ? AND competition_id = ?")
+        .bind(v.tenant_id)
+        .bind(&competition_id)
+        .execute(&mut tenant_db)
+        .await?;
+
+    let rows = player_score_rows.len() as i64;
+    for ps in player_score_rows {
+        sqlx::query("INSERT INTO player_score (id, tenant_id, player_id, competition_id, score, row_num, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+            .bind(ps.id)
+            .bind(ps.tenant_id)
+            .bind(ps.player_id)
+            .bind(ps.competition_id)
+            .bind(ps.score)
+            .bind(ps.row_num)
+            .bind(ps.created_at)
+            .bind(ps.updated_at)
+            .execute(&mut tenant_db)
+            .await?;
+    }
+
+    Ok(HttpResponse::Ok().json(SuccessResult {
+        status: true,
+        data: ScoreHandlerResult { rows },
+    }))
+}
+
+#[derive(Debug, Serialize)]
+struct BillingHandlerResult {
+    reports: Vec<BillingReport>,
+}
+
+// テナント管理者向けAPI
+// GET /api/organizer/billing
+// テナント内の課金レポートを取得する
+async fn billing_handler(
+    admin_db: web::Data<sqlx::MySqlPool>,
+    request: HttpRequest,
+) -> actix_web::Result<HttpResponse, Error> {
+    let v = parse_viewer(&admin_db, &request).await?;
+    if v.role != ROLE_ORGANIZER {
+        return Err(Error::Custom(
+            StatusCode::FORBIDDEN,
+            "role organizer required".into(),
+        ));
+    };
+
+    let mut tenant_db = connect_to_tenant_db(v.tenant_id).await?;
+
+    let cs: Vec<CompetitionRow> =
+        sqlx::query_as("SELECT * FROM competition WHERE tenant_id = ? ORDER BY created_at DESC")
+            .bind(v.tenant_id)
+            .fetch_all(&mut tenant_db)
+            .await?;
+    let mut tbrs = Vec::with_capacity(cs.len());
+    for comp in cs {
+        let report =
+            billing_report_by_competition(&admin_db, &mut tenant_db, v.tenant_id, &comp.id).await?;
+        tbrs.push(report);
+    }
+
+    let res = SuccessResult {
+        status: true,
+        data: BillingHandlerResult { reports: tbrs },
+    };
+    Ok(HttpResponse::Ok().json(res))
+}
+
+#[derive(Debug, Serialize)]
+struct PlayerScoreDetail {
+    competition_title: String,
+    score: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct PlayerHandlerResult {
+    player: PlayerDetail,
+    scores: Vec<PlayerScoreDetail>,
+}
+
+// 参加者向けAPI
+// GET /api/player/player/:player_id
+// 参加者の詳細情報を取得する
+async fn player_handler(
+    admin_db: web::Data<sqlx::MySqlPool>,
+    request: HttpRequest,
+    params: web::Path<(String,)>,
+) -> actix_web::Result<HttpResponse, Error> {
+    let v = parse_viewer(&admin_db, &request).await?;
+    if v.role != ROLE_PLAYER {
+        return Err(Error::Custom(
+            StatusCode::FORBIDDEN,
+            "role player required".into(),
+        ));
+    };
+
+    let mut tenant_db = connect_to_tenant_db(v.tenant_id).await?;
+
+    authorize_player(&mut tenant_db, &v.player_id).await?;
+
+    let (player_id,) = params.into_inner();
+    let p = match retrieve_player(&mut tenant_db, &player_id).await? {
+        Some(p) => p,
+        None => {
+            return Err(Error::Custom(
+                StatusCode::NOT_FOUND,
+                "player not found".into(),
+            ));
+        }
+    };
+    let cs: Vec<CompetitionRow> =
+        sqlx::query_as("SELECT * FROM competition WHERE tenant_id = ? ORDER BY created_at ASC")
+            .bind(v.tenant_id)
+            .fetch_all(&mut tenant_db)
+            .await?;
+
+    // player_scoreを読んでいるときに更新が走ると不整合が起こるのでロックを取得する
+    let _fl = flock_by_tenant_id(v.tenant_id).await?;
+    let mut pss = Vec::with_capacity(cs.len());
+    for c in cs {
+        // 最後にCSVに登場したスコアを採用する = row_numが一番大きいもの
+        let ps: Option<PlayerScoreRow> = sqlx::query_as("SELECT * FROM player_score WHERE tenant_id = ? AND competition_id = ? AND player_id = ? ORDER BY row_num DESC LIMIT 1")
+            .bind(v.tenant_id)
+            .bind(c.id)
+            .bind(&p.id)
+            .fetch_optional(&mut tenant_db)
+            .await?;
+        if let Some(ps) = ps {
+            pss.push(ps);
+        }
+        // 行がない = スコアが記録されてない
+    }
+
+    let mut psds = Vec::with_capacity(pss.len());
+    for ps in pss {
+        let comp = retrieve_competition(&mut tenant_db, &ps.competition_id).await?;
+        if comp.is_none() {
+            return Err(Error::Internal("error retrieve_competition".into()));
+        }
+        let comp = comp.unwrap();
+        psds.push(PlayerScoreDetail {
+            competition_title: comp.title,
+            score: ps.score,
+        });
+    }
+
+    let res = SuccessResult {
+        status: true,
+        data: PlayerHandlerResult {
+            player: PlayerDetail {
+                id: p.id,
+                display_name: p.display_name,
+                is_disqualified: p.is_disqualified,
+            },
+            scores: psds,
+        },
+    };
+    Ok(HttpResponse::Ok().json(res))
+}
+
+#[derive(Debug, Serialize)]
+struct CompetitionRank {
+    rank: i64,
+    score: i64,
+    player_id: String,
+    player_display_name: String,
+    #[serde(skip_serializing)]
+    row_num: i64, // APIレスポンスのJSONには含まれない
+}
+
+#[derive(Debug, Serialize)]
+struct CompetitionRankingHandlerResult {
+    competition: CompetitionDetail,
+    ranks: Vec<CompetitionRank>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompetitionRankingHandlerQuery {
+    rank_after: Option<i64>,
+}
+
+// 参加者向けAPI
+// GET /api/player/competition/:competition_id/ranking
+// 大会ごとのランキングを取得する
+async fn competition_ranking_handler(
+    admin_db: web::Data<sqlx::MySqlPool>,
+    request: HttpRequest,
+    params: web::Path<(String,)>,
+    query: web::Query<CompetitionRankingHandlerQuery>,
+) -> actix_web::Result<HttpResponse, Error> {
+    let v = parse_viewer(&admin_db, &request).await?;
+    if v.role != ROLE_PLAYER {
+        return Err(Error::Custom(
+            StatusCode::FORBIDDEN,
+            "role player required".into(),
+        ));
+    };
+
+    let mut tenant_db = connect_to_tenant_db(v.tenant_id).await?;
+
+    authorize_player(&mut tenant_db, &v.player_id).await?;
+
+    let (competition_id,) = params.into_inner();
+
+    // 大会の存在確認
+    let competition = match retrieve_competition(&mut tenant_db, &competition_id).await? {
+        Some(c) => c,
+        None => {
+            return Err(Error::Custom(
+                StatusCode::NOT_FOUND,
+                "competition not found".into(),
+            ));
+        }
+    };
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let tenant: TenantRow = sqlx::query_as("SELECT * FROM tenant WHERE id = ?")
+        .bind(v.tenant_id)
+        .fetch_one(&**admin_db)
+        .await?;
+
+    sqlx::query("INSERT INTO visit_history (player_id, tenant_id, competition_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)")
+        .bind(v.player_id)
+        .bind(tenant.id)
+        .bind(&competition_id)
+        .bind(now)
+        .bind(now)
+        .execute(&**admin_db)
+        .await?;
+
+    let rank_after = query.rank_after.unwrap_or(0);
+
+    // player_scoreを読んでいるときに更新が走ると不整合が起こるのでロックを取得する
+    let _fl = flock_by_tenant_id(v.tenant_id).await?;
+    let pss: Vec<PlayerScoreRow> = sqlx::query_as("SELECT * FROM player_score WHERE tenant_id = ? AND competition_id = ? ORDER BY row_num DESC")
+        .bind(tenant.id)
+        .bind(&competition_id)
+        .fetch_all(&mut tenant_db)
+        .await?;
+    let mut ranks = Vec::with_capacity(pss.len());
+    let mut scored_player_set = HashSet::with_capacity(pss.len());
+    for ps in pss {
+        // player_scoreが同一player_id内ではrow_numの降順でソートされているので
+        // 現れたのが2回目以降のplayer_idはより大きいrow_numでスコアが出ているとみなせる
+        if scored_player_set.contains(&ps.player_id) {
+            continue;
+        }
+        let p = retrieve_player(&mut tenant_db, &ps.player_id).await?;
+        if p.is_none() {
+            return Err(Error::Internal("error retrieve_player".into()));
+        }
+        let p = p.unwrap();
+        scored_player_set.insert(ps.player_id);
+        ranks.push(CompetitionRank {
+            rank: 0,
+            score: ps.score,
+            player_id: p.id,
+            player_display_name: p.display_name,
+            row_num: ps.row_num,
+        })
+    }
+    ranks.sort_by(|a, b| b.score.cmp(&a.score).then(a.row_num.cmp(&b.row_num)));
+    let mut paged_ranks = Vec::with_capacity(100);
+    for (i, rank) in ranks.into_iter().enumerate() {
+        let i = i as i64;
+        if i < rank_after {
+            continue;
+        }
+        paged_ranks.push(CompetitionRank {
+            rank: i + 1,
+            score: rank.score,
+            player_id: rank.player_id,
+            player_display_name: rank.player_display_name,
+            row_num: 0,
+        });
+        if paged_ranks.len() >= 100 {
+            break;
+        }
+    }
+
+    let res = SuccessResult {
+        status: true,
+        data: CompetitionRankingHandlerResult {
+            competition: CompetitionDetail {
+                id: competition.id,
+                title: competition.title,
+                is_finished: competition.finished_at.is_some(),
+            },
+            ranks: paged_ranks,
+        },
+    };
 
     Ok(HttpResponse::Ok().json(res))
 }
 
-// ISUからのコンディションを受け取る
-#[actix_web::post("/api/condition/{jia_isu_uuid}")]
-async fn post_isu_condition(
-    pool: web::Data<sqlx::MySqlPool>,
-    jia_isu_uuid: web::Path<String>,
-    req: web::Json<Vec<PostIsuConditionRequest>>,
-) -> actix_web::Result<HttpResponse> {
-    // TODO: 一定割合リクエストを落としてしのぐようにしたが、本来は全量さばけるようにすべき
-    const DROP_PROBABILITY: f64 = 0.9;
-    if rand::random::<f64>() <= DROP_PROBABILITY {
-        log::warn!("drop post isu condition request");
-        return Ok(HttpResponse::Accepted().finish());
-    }
-
-    if req.is_empty() {
-        return Err(actix_web::error::ErrorBadRequest("bad request body"));
-    }
-
-    let mut tx = pool.begin().await.map_err(SqlxError)?;
-
-    let count: i64 = fetch_one_scalar(
-        sqlx::query_scalar("SELECT COUNT(*) FROM `isu` WHERE `jia_isu_uuid` = ?")
-            .bind(jia_isu_uuid.as_ref()),
-        &mut tx,
-    )
-    .await
-    .map_err(SqlxError)?;
-    if count == 0 {
-        return Err(actix_web::error::ErrorNotFound("not found: isu"));
-    }
-
-    for cond in req.iter() {
-        let timestamp: DateTime<chrono::FixedOffset> = DateTime::from_utc(
-            NaiveDateTime::from_timestamp(cond.timestamp, 0),
-            JST_OFFSET.fix(),
-        );
-
-        if !is_valid_condition_format(&cond.condition) {
-            return Err(actix_web::error::ErrorBadRequest("bad request body"));
-        }
-
-        sqlx::query(
-            "INSERT INTO `isu_condition` (`jia_isu_uuid`, `timestamp`, `is_sitting`, `condition`, `message`) VALUES (?, ?, ?, ?, ?)",
-        )
-            .bind(jia_isu_uuid.as_ref())
-            .bind(&timestamp.naive_local())
-            .bind(&cond.is_sitting)
-            .bind(&cond.condition)
-            .bind(&cond.message)
-            .execute(&mut tx)
-            .await.map_err(SqlxError)?;
-    }
-
-    tx.commit().await.map_err(SqlxError)?;
-
-    Ok(HttpResponse::Accepted().finish())
+#[derive(Debug, Serialize)]
+struct CompetitionsHandlerResult {
+    competitions: Vec<CompetitionDetail>,
 }
 
-// ISUのコンディションの文字列がcsv形式になっているか検証
-fn is_valid_condition_format(condition_str: &str) -> bool {
-    let keys = ["is_dirty=", "is_overweight=", "is_broken="];
-    const VALUE_TRUE: &str = "true";
-    const VALUE_FALSE: &str = "false";
+// 参加者向けAPI
+// GET /api/player/competitions
+// 大会の一覧を取得する
+async fn player_competitions_handler(
+    admin_db: web::Data<sqlx::MySqlPool>,
+    request: HttpRequest,
+) -> actix_web::Result<HttpResponse, Error> {
+    let v = parse_viewer(&admin_db, &request).await?;
+    if v.role != ROLE_PLAYER {
+        return Err(Error::Custom(
+            StatusCode::FORBIDDEN,
+            "role player required".into(),
+        ));
+    };
 
-    let mut idx_cond_str = 0;
-
-    for (idx_keys, key) in keys.iter().enumerate() {
-        if !condition_str[idx_cond_str..].starts_with(key) {
-            return false;
-        }
-        idx_cond_str += key.len();
-
-        if condition_str[idx_cond_str..].starts_with(VALUE_TRUE) {
-            idx_cond_str += VALUE_TRUE.len();
-        } else if condition_str[idx_cond_str..].starts_with(VALUE_FALSE) {
-            idx_cond_str += VALUE_FALSE.len();
-        } else {
-            return false;
-        }
-
-        if idx_keys < keys.len() - 1 {
-            if !condition_str[idx_cond_str..].starts_with(',') {
-                return false;
-            }
-            idx_cond_str += 1;
-        }
-    }
-
-    idx_cond_str == condition_str.len()
+    let mut tenant_db = connect_to_tenant_db(v.tenant_id).await?;
+    authorize_player(&mut tenant_db, &v.player_id).await?;
+    competitions_handler(v, tenant_db).await
 }
 
-async fn get_index() -> actix_web::Result<actix_files::NamedFile> {
-    Ok(actix_files::NamedFile::open(
-        std::path::Path::new(FRONTEND_CONTENTS_PATH).join("index.html"),
-    )?)
+// テナント管理者向けAPI
+// GET /api/organizer/competitions
+// 大会の一覧を取得する
+async fn organizer_competitions_handler(
+    admin_db: web::Data<sqlx::MySqlPool>,
+    request: HttpRequest,
+) -> actix_web::Result<HttpResponse, Error> {
+    let v = parse_viewer(&admin_db, &request).await?;
+    if v.role != ROLE_ORGANIZER {
+        return Err(Error::Custom(
+            StatusCode::FORBIDDEN,
+            "role organizer required".into(),
+        ));
+    };
+    let tenant_db = connect_to_tenant_db(v.tenant_id).await?;
+    competitions_handler(v, tenant_db).await
+}
+
+async fn competitions_handler(
+    v: Viewer,
+    mut tenant_db: SqliteConnection,
+) -> actix_web::Result<HttpResponse, Error> {
+    let cs: Vec<CompetitionRow> =
+        sqlx::query_as("SELECT * FROM competition WHERE tenant_id=? ORDER BY created_at DESC")
+            .bind(v.tenant_id)
+            .fetch_all(&mut tenant_db)
+            .await?;
+    let mut cds = Vec::with_capacity(cs.len());
+    for comp in cs {
+        cds.push(CompetitionDetail {
+            id: comp.id,
+            title: comp.title,
+            is_finished: comp.finished_at.is_some(),
+        })
+    }
+
+    let res = SuccessResult {
+        status: true,
+        data: CompetitionsHandlerResult { competitions: cds },
+    };
+    Ok(HttpResponse::Ok().json(res))
+}
+
+#[derive(Debug, Serialize)]
+struct TenantDetail {
+    name: String,
+    display_name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct MeHandlerResult {
+    tenant: Option<TenantDetail>,
+    me: Option<PlayerDetail>,
+    role: String,
+    logged_in: bool,
+}
+
+// 共通API
+// GET /api/me
+// JWTで認証した結果、テナントやユーザ情報を返す
+async fn me_handler(
+    admin_db: web::Data<sqlx::MySqlPool>,
+    request: HttpRequest,
+) -> actix_web::Result<HttpResponse, Error> {
+    let tenant = match retrieve_tenant_row_from_header(&admin_db, &request).await? {
+        Some(t) => t,
+        None => {
+            return Err(Error::Internal(
+                "error retrieve_tenant_row_from_header".into(),
+            ));
+        }
+    };
+    let td = TenantDetail {
+        name: tenant.name,
+        display_name: tenant.display_name,
+    };
+    let v = match parse_viewer(&admin_db, &request).await {
+        Ok(v) => v,
+        Err(e) if e.status_code() == StatusCode::UNAUTHORIZED => {
+            return Ok(HttpResponse::Ok().json(SuccessResult {
+                status: true,
+                data: MeHandlerResult {
+                    tenant: Some(td),
+                    me: None,
+                    role: "none".to_string(),
+                    logged_in: false,
+                },
+            }));
+        }
+        Err(e) => {
+            return Err(Error::Internal(format!("error parse_viewer: {}", e).into()));
+        }
+    };
+    if v.role == ROLE_ADMIN || v.role == ROLE_ORGANIZER {
+        return Ok(HttpResponse::Ok().json(SuccessResult {
+            status: true,
+            data: MeHandlerResult {
+                tenant: Some(td),
+                me: None,
+                role: v.role,
+                logged_in: true,
+            },
+        }));
+    }
+
+    let mut tenant_db = connect_to_tenant_db(v.tenant_id).await?;
+    let p = match retrieve_player(&mut tenant_db, &v.player_id).await? {
+        Some(p) => p,
+        None => {
+            return Ok(HttpResponse::Ok().json(SuccessResult {
+                status: true,
+                data: MeHandlerResult {
+                    tenant: Some(td),
+                    me: None,
+                    role: "none".to_string(),
+                    logged_in: false,
+                },
+            }));
+        }
+    };
+
+    Ok(HttpResponse::Ok().json(SuccessResult {
+        status: true,
+        data: MeHandlerResult {
+            tenant: Some(td),
+            me: Some(PlayerDetail {
+                id: p.id,
+                display_name: p.display_name,
+                is_disqualified: p.is_disqualified,
+            }),
+            role: v.role,
+            logged_in: true,
+        },
+    }))
+}
+
+#[derive(Debug, Serialize)]
+struct InitializeHandlerResult {
+    lang: &'static str,
+}
+
+// ベンチマーカー向けAPI
+// POST /initialize
+// ベンチマーカーが起動したときに最初に呼ぶ
+// データベースの初期化などが実行されるため、スキーマを変更した場合などは適宜改変すること
+async fn initialize_handler() -> Result<HttpResponse, Error> {
+    let output = tokio::process::Command::new(INITIALIZE_SCRIPT)
+        .output()
+        .await
+        .map_err(|e| Error::Internal(format!("error exec command: {}", e).into()))?;
+    if output.status.success() {
+        let res = InitializeHandlerResult { lang: "rust" };
+        Ok(HttpResponse::Ok().json(SuccessResult {
+            status: true,
+            data: res,
+        }))
+    } else {
+        Err(Error::Internal(
+            format!(
+                "error exec command: out={}, err={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into(),
+        ))
+    }
 }

@@ -2,33 +2,22 @@
 
 declare(strict_types=1);
 
-use App\Application\Middleware\AccessLog as AccessLogMiddleware;
 use App\Application\Settings\SettingsInterface;
+use SQLTrace\Middleware as SQLTraceMiddleware;
 use DI\ContainerBuilder;
-use GuzzleHttp\Client as HttpClient;
-use GuzzleHttp\ClientInterface as HttpClientInterface;
+use Doctrine\DBAL\Configuration as DBConfiguration;
+use Doctrine\DBAL\Connection;
+use Doctrine\DBAL\DriverManager;
+use Monolog\Formatter\LineFormatter;
 use Monolog\Handler\StreamHandler;
 use Monolog\Logger;
 use Monolog\Processor\UidProcessor;
 use Psr\Container\ContainerInterface;
 use Psr\Log\LoggerInterface;
-use Slim\Middleware\Session;
-use SlimSession\Helper as SessionHelper;
 
 return function (ContainerBuilder $containerBuilder) {
     $containerBuilder->addDefinitions([
-        AccessLogMiddleware::class => function (ContainerInterface $c): AccessLogMiddleware {
-            $logger = new Logger('access-log');
-
-            $handler = new StreamHandler('php://stdout');
-            $logger->pushHandler($handler);
-
-            return new AccessLogMiddleware($logger);
-        },
-        HttpClientInterface::class => function (ContainerInterface $c): HttpClientInterface {
-            return new HttpClient();
-        },
-        LoggerInterface::class => function (ContainerInterface $c): LoggerInterface {
+        LoggerInterface::class => function (ContainerInterface $c) {
             $settings = $c->get(SettingsInterface::class);
 
             $loggerSettings = $settings->get('logger');
@@ -42,28 +31,43 @@ return function (ContainerBuilder $containerBuilder) {
 
             return $logger;
         },
-        PDO::class => function (ContainerInterface $c): PDO {
+        Connection::class => function (ContainerInterface $c) {
             $databaseSettings = $c->get(SettingsInterface::class)->get('database');
 
-            $dsn = vsprintf('mysql:host=%s;dbname=%s;port=%d;charset=utf8mb4', [
-                $databaseSettings['host'],
-                $databaseSettings['database'],
-                $databaseSettings['port']
-            ]);
+            $connectionParams = [
+                'dbname' => $databaseSettings['database'],
+                'user' => $databaseSettings['user'],
+                'password' => $databaseSettings['password'],
+                'host' => $databaseSettings['host'],
+                'driver' => 'pdo_mysql',
+                'driverOptions' => [
+                    PDO::ATTR_PERSISTENT => true,
+                    PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+                    PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+                ],
+            ];
 
-            $pdo = new PDO($dsn, $databaseSettings['user'], $databaseSettings['password'], [
-                PDO::ATTR_PERSISTENT => true,
-            ]);
-
-            return $pdo;
+            return DriverManager::getConnection($connectionParams);
         },
-        Session::class => function (ContainerInterface $c): Session {
-            $sessionSettings = $c->get(SettingsInterface::class)->get('session');
+        DBConfiguration::class => function (ContainerInterface $c) {
+            $configuration = new DBConfiguration();
 
-            return new Session($sessionSettings);
+            // sqliteのクエリログを出力する設定
+            // sqltrace を参照
+            $sqliteTraceSettings = $c->get(SettingsInterface::class)->get('sqliteTrace');
+            $traceFilePath = $sqliteTraceSettings['path'];
+            if ($traceFilePath) {
+                $logger = new Logger($sqliteTraceSettings['name']);
+
+                $handler = new StreamHandler($traceFilePath);
+                $handler->setFormatter(new LineFormatter('%message%' . PHP_EOL));
+
+                $logger->pushHandler($handler);
+
+                $configuration->setMiddlewares([new SQLTraceMiddleware($logger)]);
+            }
+
+            return $configuration;
         },
-        SessionHelper::class => function (ContainerInterface $c): SessionHelper {
-            return new SessionHelper();
-        }
     ]);
 };

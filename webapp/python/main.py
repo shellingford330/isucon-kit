@@ -1,838 +1,1079 @@
-from os import getenv
-from subprocess import call
+import codecs
+import csv
+import fcntl
+import os
+import re
+import subprocess
 from dataclasses import dataclass
-import json
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
-import urllib.request
-from random import random
-from enum import Enum
-from flask import Flask, request, session, send_file, jsonify, abort, make_response
-from flask.json import JSONEncoder
-from werkzeug.exceptions import (
-    Forbidden,
-    HTTPException,
-    BadRequest,
-    Unauthorized,
-    NotFound,
-    InternalServerError,
-)
-import mysql.connector
-from sqlalchemy.pool import QueuePool
+from datetime import datetime
+from io import TextIOWrapper
+from typing import Any, Optional
+
 import jwt
+from flask import Flask, abort, jsonify, request
+from sqlalchemy import create_engine
+from sqlalchemy.engine import Engine
+from sqlalchemy.exc import IntegrityError, OperationalError
+from werkzeug.exceptions import HTTPException
+
+from sqltrace import initialize_sql_logger
+
+INITIALIZE_SCRIPT = "../sql/init.sh"
+COOKIE_NAME = "isuports_session"
+TENANT_DB_SCHEMA_FILE_PATH = "../sql/tenant/10_schema.sql"
+
+ROLE_ADMIN = "admin"
+ROLE_ORGANIZER = "organizer"
+ROLE_PLAYER = "player"
+ROLE_NONE = "none"
+
+# 正しいテナント名の正規表現
+TENANT_NAME_REGEXP = re.compile(r"^[a-z][a-z0-9-]{0,61}[a-z0-9]$")
+
+admin_db: Engine = None
+
+app = Flask(__name__)
 
 
-TZ = ZoneInfo("Asia/Tokyo")
-CONDITION_LIMIT = 20
-FRONTEND_CONTENTS_PATH = "../public"
-JIA_JWT_SIGNING_KEY_PATH = "../ec256-public.pem"
-DEFAULT_ICON_FILE_PATH = "../NoImage.jpg"
-DEFAULT_JIA_SERVICE_URL = "http://localhost:5000"
-MYSQL_ERR_NUM_DUPLICATE_ENTRY = 1062
+def connect_admin_db() -> Engine:
+    """管理用DBに接続する"""
+    host = os.getenv("ISUCON_DB_HOST", "127.0.0.1")
+    port = os.getenv("ISUCON_DB_PORT", 3306)
+    user = os.getenv("ISUCON_DB_USER", "isucon")
+    password = os.getenv("ISUCON_DB_PASSWORD", "isucon")
+    database = os.getenv("ISUCON_DB_NAME", "isuports")
+
+    return create_engine(f"mysql+mysqlconnector://{user}:{password}@{host}:{port}/{database}", pool_size=10)
 
 
-class CONDITION_LEVEL(str, Enum):
-    INFO = "info"
-    WARNING = "warning"
-    CRITICAL = "critical"
+def tenant_db_path(id: int) -> str:
+    """テナントDBのパスを返す"""
+    tenant_db_dir = os.getenv("ISUCON_TENANT_DB_DIR", "../tenant_db")
+    return tenant_db_dir + f"/{id}.db"
 
 
-class SCORE_CONDITION_LEVEL(int, Enum):
-    INFO = 3
-    WARNING = 2
-    CRITICAL = 1
+def connect_to_tenant_db(id: int) -> Engine:
+    """テナントDBに接続する"""
+    path = tenant_db_path(id)
+    engine = create_engine(f"sqlite:///{path}")
+    return initialize_sql_logger(engine)
 
 
-@dataclass
-class Isu:
-    id: int
-    jia_isu_uuid: int
-    name: str
-    image: bytes
-    character: str
-    jia_user_id: str
-    created_at: datetime
-    updated_at: datetime
+def create_tenant_db(id: int):
+    """テナントDBを新規に作成する"""
+    path = tenant_db_path(id)
+
+    command = f"sqlite3 {path} < {TENANT_DB_SCHEMA_FILE_PATH}"
+    subprocess.run(["bash", "-c", command])
 
 
-@dataclass
-class IsuCondition:
-    id: int
-    jia_isu_uuid: str
-    timestamp: datetime
-    is_sitting: bool
-    condition: str
-    message: str
-    created_at: datetime
+def dispense_id() -> str:
+    """システム全体で一意なIDを生成する"""
+    id = 0
+    last_err = None
+    for i in range(100):
+        try:
+            res = admin_db.execute("REPLACE INTO id_generator (stub) VALUES (%s)", "a")
+            id = res.lastrowid
+            if id != 0:
+                return hex(id)[2:]
+        except OperationalError as e:  # deadlock
+            last_err = e
+            continue
 
-    def __post_init__(self):
-        if type(self.is_sitting) is int:
-            self.is_sitting = bool(self.is_sitting)
-        if type(self.timestamp) is datetime:
-            self.timestamp = self.timestamp.astimezone(TZ)
-        if type(self.created_at) is datetime:
-            self.created_at = self.created_at.astimezone(TZ)
+    raise RuntimeError from last_err
 
 
-@dataclass
-class ConditionsPercentage:
-    sitting: int
-    is_broken: int
-    is_dirty: int
-    is_overweight: int
+@app.after_request
+def add_header(response):
+    """全APIにCache-Control: privateを設定する"""
+    if "Cache-Control" not in response.headers:
+        response.headers["Cache-Control"] = "private"
+    return response
 
 
-@dataclass
-class GraphDataPoint:
-    score: int
-    percentage: ConditionsPercentage
+def run():
+    global admin_db
+    admin_db = connect_admin_db()
 
-
-@dataclass
-class GraphDataPointWithInfo:
-    jia_isu_uuid: str
-    start_at: datetime
-    data: GraphDataPoint
-    condition_timestamps: list[int]
-
-
-@dataclass
-class GraphResponse:
-    start_at: int
-    end_at: int
-    data: GraphDataPoint
-    condition_timestamps: list[int]
-
-
-@dataclass
-class GetIsuConditionResponse:
-    jia_isu_uuid: str
-    isu_name: str
-    timestamp: int
-    is_sitting: bool
-    condition: str
-    condition_level: str
-    message: str
-
-
-@dataclass
-class GetIsuListResponse:
-    id: int
-    jia_isu_uuid: str
-    name: str
-    character: str
-    latest_isu_condition: GetIsuConditionResponse
-
-
-@dataclass
-class TrendCondition:
-    isu_id: int
-    timestamp: int
-
-
-@dataclass
-class TrendResponse:
-    character: str
-    info: list[TrendCondition]
-    warning: list[TrendCondition]
-    critical: list[TrendCondition]
-
-
-@dataclass
-class PostIsuConditionRequest:
-    is_sitting: bool
-    condition: str
-    message: str
-    timestamp: int
-
-
-class CustomJSONEncoder(JSONEncoder):
-    def default(self, obj):
-        if isinstance(obj, Isu):
-            cols = ["id", "jia_isu_uuid", "name", "character"]
-            return {col: obj.__dict__[col] for col in cols}
-        return JSONEncoder.default(self, obj)
-
-
-app = Flask(__name__, static_folder=f"{FRONTEND_CONTENTS_PATH}/assets", static_url_path="/assets")
-app.session_cookie_name = "isucondition_python"
-app.secret_key = getenv("SESSION_KEY", "isucondition")
-app.json_encoder = CustomJSONEncoder
-app.send_file_max_age_default = timedelta(0)
-app.config["JSON_AS_ASCII"] = False
+    app.run(host="0.0.0.0", port=3000, debug=True, threaded=True)
 
 
 @app.errorhandler(HTTPException)
-def error_handler(e):
-    return make_response(e.description, e.code, {"Content-Type": "text/plain"})
+def error_handler(e: HTTPException):
+    return jsonify(FailureResult(status=False, message=e.description)), e.code
 
 
-mysql_connection_env = {
-    "host": getenv("MYSQL_HOST", "127.0.0.1"),
-    "port": getenv("MYSQL_PORT", 3306),
-    "user": getenv("MYSQL_USER", "isucon"),
-    "password": getenv("MYSQL_PASS", "isucon"),
-    "database": getenv("MYSQL_DBNAME", "isucondition"),
-    "time_zone": "+09:00",
-}
-
-cnxpool = QueuePool(lambda: mysql.connector.connect(**mysql_connection_env), pool_size=10)
+@dataclass
+class SuccessResult:
+    status: bool
+    data: Any
 
 
-def select_all(query, *args, dictionary=True):
-    cnx = cnxpool.connect()
+@dataclass
+class FailureResult:
+    status: bool
+    message: str
+
+
+@dataclass
+class Viewer:
+    """アクセスしたきた人の情報"""
+    role: str
+    player_id: str
+    tenant_name: str
+    tenant_id: int
+
+
+def parse_viewer() -> Viewer:
+    """リクエストヘッダをパースしてViewerを返す"""
+    token_str = request.cookies.get(COOKIE_NAME)
+    if not token_str:
+        abort(401, f"cookie {COOKIE_NAME} is not found")
+
+    key_filename = os.getenv("ISUCON_JWT_KEY_FILE", "../public.pem")
+    key = open(key_filename, "r").read()
+
+    tenant = retrieve_tenant_row_from_header()
     try:
-        cur = cnx.cursor(dictionary=dictionary)
-        cur.execute(query, *args)
-        return cur.fetchall()
+        token = jwt.decode(token_str, key, audience=tenant.name, algorithms=["RS256"])
+    except jwt.ExpiredSignatureError:
+        abort(401, "Signature has expire")
+    except Exception:
+        abort(401, "error jwt.decode")
+
+    if not token.get("sub"):
+        abort(401, f"invalid token: subject is not found in token: {token_str}")
+
+    role = token.get("role")
+    if not role:
+        abort(401, f"invalid token: role is not found: {token_str}")
+
+    if role not in [ROLE_ADMIN, ROLE_ORGANIZER, ROLE_PLAYER]:
+        abort(401, f"invalid token: invalid role: {token_str}")
+
+    aud = token.get("aud")
+    if len(aud) != 1:
+        abort(401, f"invalid token: aud field is few or too much: {token_str}")
+
+    if tenant.name == "admin" and role != ROLE_ADMIN:
+        abort(401, "tenant not found")
+
+    if tenant.name != aud[0]:
+        abort(401, f"invalid token: tenant name is not match with {request.host}: {token_str}")
+
+    return Viewer(
+        role=role,
+        player_id=token.get("sub"),
+        tenant_name=tenant.name,
+        tenant_id=tenant.id,
+    )
+
+
+@dataclass
+class TenantRow:
+    name: str
+    display_name: str
+    id: Optional[int] = None
+    created_at: Optional[int] = None
+    updated_at: Optional[int] = None
+
+
+def retrieve_tenant_row_from_header() -> TenantRow:
+    """JWTに入っているテナント名とHostヘッダのテナント名が一致しているか確認"""
+    base_host = os.getenv("ISUCON_BASE_HOSTNAME", ".t.isucon.local")
+    tenant_name = request.host.removesuffix(base_host)
+
+    # SaaS管理者用ドメイン
+    if tenant_name == "admin":
+        return TenantRow(
+            name="admin",
+            display_name="admin",
+        )
+
+    # テナントの存在確認
+    row = admin_db.execute("SELECT * FROM tenant WHERE name = %s", tenant_name).fetchone()
+    if not row:
+        abort(401, "tenant not found")
+
+    return TenantRow(**row)
+
+
+@dataclass
+class PlayerRow:
+    tenant_id: int
+    id: str
+    display_name: str
+    is_disqualified: bool
+    created_at: int
+    updated_at: int
+
+
+def retrieve_player(tenant_db: Engine, id: str) -> Optional[PlayerRow]:
+    """参加者を取得する"""
+    row = tenant_db.execute("SELECT * FROM player WHERE id = ?", id).fetchone()
+    if not row:
+        return None
+
+    return PlayerRow(
+        tenant_id=row.tenant_id,
+        id=row.id,
+        display_name=row.display_name,
+        is_disqualified=bool(row.is_disqualified),
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
+def authorize_player(tenant_db: Engine, id: str):
+    player = retrieve_player(tenant_db, id)
+    if not player:
+        abort(401, "player not found")
+
+    if player.is_disqualified:
+        abort(403, "player is disqualified")
+
+
+@dataclass
+class CompetitionRow:
+    tenant_id: int
+    id: str
+    title: str
+    finished_at: Optional[int]
+    created_at: int
+    updated_at: int
+
+
+def retrieve_competition(tenant_db: Engine, id: str) -> Optional[CompetitionRow]:
+    """大会を取得する"""
+    row = tenant_db.execute("SELECT * FROM competition WHERE id = ?", id).fetchone()
+    if not row:
+        return None
+
+    return CompetitionRow(**row)
+
+
+@dataclass
+class PlayerScoreRow:
+    tenant_id: int
+    id: str
+    player_id: str
+    competition_id: str
+    score: int
+    row_num: int
+    created_at: int
+    updated_at: int
+
+
+def lock_file_path(id: int) -> str:
+    """排他ロックのためのファイル名を生成する"""
+    tenant_db_dir = os.getenv("ISUCON_TENANT_DB_DIR", "../tenant_db")
+    return os.path.join(tenant_db_dir, f"{id}.lock")
+
+
+def flock_by_tenant_id(tenant_id: int) -> Optional[TextIOWrapper]:
+    """排他ロックする"""
+    path = lock_file_path(tenant_id)
+    lock_file = open(path, "a")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        return lock_file
+    except OSError:
+        lock_file.close()
+        return None
+
+
+@app.route("/api/admin/tenants/add", methods=["POST"])
+def tenants_add_handler():
+    """
+    SasS管理者用API
+    テナントを追加する
+    """
+    viewer = parse_viewer()
+    if viewer.tenant_name != "admin":
+        # admin: SaaS管理者用の特別なテナント名
+        abort(404, f"{viewer.tenant_name} has not this API")
+
+    if viewer.role != ROLE_ADMIN:
+        abort(403, "admin role required")
+
+    display_name = request.values.get("display_name")
+    name = request.values.get("name")
+
+    validate_tenant_name(name)
+
+    now = int(datetime.now().timestamp())
+    try:
+        res = admin_db.execute(
+            "INSERT INTO tenant (name, display_name, created_at, updated_at) VALUES (%s, %s, %s, %s)",
+            name,
+            display_name,
+            now,
+            now,
+        )
+        id = res.lastrowid
+    except IntegrityError:  # duplicate entry
+        abort(400, "duplicate tenant")
+
+    # NOTE: 先にadminDBに書き込まれることでこのAPIの処理中に
+    #       /api/admin/tenants/billingにアクセスされるとエラーになりそう
+    #       ロックなどで対処したほうが良さそう
+    create_tenant_db(id)
+
+    return jsonify(
+        SuccessResult(
+            status=True,
+            data={
+                "tenant": TenantWithBilling(
+                    id=str(id),
+                    name=name,
+                    display_name=display_name,
+                    billing=0,
+                )
+            },
+        )
+    )
+
+
+def validate_tenant_name(name):
+    """テナント名が規則に沿っているかチェックする"""
+    if TENANT_NAME_REGEXP.match(name) is None:
+        abort(400, f"invalid tenant name: {name}")
+
+
+@dataclass
+class BillingReport:
+    competition_id: str
+    competition_title: str
+    player_count: int  # スコアを登録した参加者数
+    visitor_count: int  # ランキングを閲覧だけした(スコアを登録していない)参加者数
+    billing_player_yen: int  # 請求金額 スコアを登録した参加者分
+    billing_visitor_yen: int  # 請求金額 ランキングを閲覧だけした(スコアを登録していない)参加者分
+    billing_yen: int  # 合計請求金額
+
+
+def billing_report_by_competition(tenant_db: Engine, tenant_id: int, competition_id: str):
+    """大会ごとの課金レポートを計算する"""
+    competition = retrieve_competition(tenant_db, competition_id)
+    if not competition:
+        raise RuntimeError("error retrieveCompetition")
+
+    visit_history_summary_rows = admin_db.execute(
+        "SELECT player_id, MIN(created_at) AS min_created_at FROM visit_history WHERE tenant_id = %s AND competition_id = %s GROUP BY player_id",
+        tenant_id,
+        competition.id,
+    ).fetchall()
+
+    billing_map = {}
+    for vh in visit_history_summary_rows:
+        # competition.finished_atよりもあとの場合は、終了後に訪問したとみなして大会開催内アクセス済みとみなさない
+        if bool(competition.finished_at) and competition.finished_at < vh.min_created_at:
+            continue
+        billing_map[str(vh.player_id)] = "visitor"
+
+    # player_scoreを読んでいるときに更新が走ると不整合が起こるのでロックを取得する
+    lock_file = flock_by_tenant_id(tenant_id)
+    if not lock_file:
+        raise RuntimeError("error flock_by_tenant_id")
+
+    try:
+        # スコアを登録した参加者のIDを取得する
+        scored_player_id_rows = tenant_db.execute(
+            "SELECT DISTINCT(player_id) FROM player_score WHERE tenant_id = ? AND competition_id = ?",
+            tenant_id,
+            competition.id,
+        ).fetchall()
+
+        for pid in scored_player_id_rows:
+            # スコアが登録されている参加者
+            billing_map[str(pid.player_id)] = "player"
+
+        player_count = 0
+        visitor_count = 0
+        if bool(competition.finished_at):
+            for category in billing_map.values():
+                if category == "player":
+                    player_count += 1
+                if category == "visitor":
+                    visitor_count += 1
     finally:
-        cnx.close()
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_file.close()
+
+    return BillingReport(
+        competition_id=competition.id,
+        competition_title=competition.title,
+        player_count=player_count,
+        visitor_count=visitor_count,
+        billing_player_yen=100 * player_count,
+        billing_visitor_yen=10 * visitor_count,
+        billing_yen=100 * player_count + 10 * visitor_count,
+    )
 
 
-def select_row(*args, **kwargs):
-    rows = select_all(*args, **kwargs)
-    return rows[0] if len(rows) > 0 else None
+@dataclass
+class TenantWithBilling:
+    id: str
+    name: str
+    display_name: str
+    billing: int
 
 
-with open(JIA_JWT_SIGNING_KEY_PATH, "rb") as f:
-    jwt_public_key = f.read()
-
-post_isu_condition_target_base_url = getenv("POST_ISUCONDITION_TARGET_BASE_URL")
-if post_isu_condition_target_base_url is None:
-    raise Exception("missing: POST_ISUCONDITION_TARGET_BASE_URL")
-
-
-def get_user_id_from_session():
-    jia_user_id = session.get("jia_user_id")
-
-    if jia_user_id is None:
-        raise Unauthorized("you are not signed in")
-
-    query = "SELECT COUNT(*) FROM `user` WHERE `jia_user_id` = %s"
-    (count,) = select_row(query, (jia_user_id,), dictionary=False)
-
-    if count == 0:
-        raise Unauthorized("you are not signed in")
-
-    return jia_user_id
+@dataclass
+class PlayerDetail:
+    id: str
+    display_name: str
+    is_disqualified: bool
 
 
-def get_jia_service_url() -> str:
-    query = "SELECT * FROM `isu_association_config` WHERE `name` = %s"
-    config = select_row(query, ("jia_service_url",))
-    return config["url"] if config is not None else DEFAULT_JIA_SERVICE_URL
+@app.route("/api/admin/tenants/billing", methods=["GET"])
+def tenants_billing_handler():
+    """
+    SaaS管理者用API
+    テナントごとの課金レポートを最大20件、テナントのid降順で取得する
+    URL引数beforeを指定した場合、指定した値よりもidが小さいテナントの課金レポートを取得する
+    """
+    if request.host != os.getenv("ISUCON_ADMIN_HOSTNAME", "admin.t.isucon.local"):
+        abort(404, f"invalid hostname {request.host}")
+
+    viewer = parse_viewer()
+    if viewer.role != ROLE_ADMIN:
+        abort(403, "admin role required")
+
+    before = request.args.get("before")
+    before_id = 0
+    if before:
+        before_id = int(before)
+
+    # テナントごとに
+    #   大会ごとに
+    #     scoreが登録されているplayer * 100
+    #     scoreが登録されていないplayerでアクセスした人 * 10
+    #   を合計したものを
+    # テナントの課金とする
+    tenant_rows = admin_db.execute("SELECT * FROM tenant ORDER BY id DESC").fetchall()
+    tenant_billings = []
+    for tenant_row in tenant_rows:
+        if before_id != 0 and before_id <= tenant_row.id:
+            continue
+        tenant_billing = TenantWithBilling(
+            id=str(tenant_row.id), name=tenant_row.name, display_name=tenant_row.display_name, billing=0
+        )
+        tenant_db = connect_to_tenant_db(int(tenant_row.id))
+        competition_rows = tenant_db.execute("SELECT * FROM competition WHERE tenant_id=?", tenant_row.id).fetchall()
+
+        for competition_row in competition_rows:
+            report = billing_report_by_competition(tenant_db, tenant_row.id, competition_row.id)
+            tenant_billing.billing += report.billing_yen
+        tenant_billings.append(tenant_billing)
+
+        if len(tenant_billings) >= 10:
+            break
+
+    return jsonify(SuccessResult(status=True, data={"tenants": tenant_billings}))
+
+
+@app.route("/api/organizer/players", methods=["GET"])
+def players_list_handler():
+    """
+    テナント管理者向けAPI
+    参加者一覧を返す
+    """
+    viewer = parse_viewer()
+    if viewer.role != ROLE_ORGANIZER:
+        abort(403, "role organizer required")
+
+    tenant_db = connect_to_tenant_db(viewer.tenant_id)
+
+    rows = tenant_db.execute(
+        "SELECT * FROM player WHERE tenant_id=? ORDER BY created_at DESC",
+        viewer.tenant_id,
+    ).fetchall()
+
+    player_details = []
+    for row in rows:
+        player_details.append(
+            PlayerDetail(
+                id=row.id,
+                display_name=row.display_name,
+                is_disqualified=bool(row.is_disqualified),
+            )
+        )
+
+    return jsonify(SuccessResult(status=True, data={"players": player_details}))
+
+
+@app.route("/api/organizer/players/add", methods=["POST"])
+def players_add_handler():
+    """
+    テナント管理者向けAPI
+    テナントに参加者を追加する
+    """
+    viewer = parse_viewer()
+    if viewer.role != ROLE_ORGANIZER:
+        abort(403, "role organizer required")
+
+    tenant_db = connect_to_tenant_db(viewer.tenant_id)
+
+    display_names = request.values.getlist("display_name[]")
+
+    player_details = []
+    for display_name in display_names:
+        id = dispense_id()
+
+        now = int(datetime.now().timestamp())
+
+        tenant_db.execute(
+            "INSERT INTO player (id, tenant_id, display_name, is_disqualified, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            id,
+            viewer.tenant_id,
+            display_name,
+            False,
+            now,
+            now,
+        )
+
+        player = retrieve_player(tenant_db, id)
+        player_details.append(
+            PlayerDetail(
+                id=player.id,
+                display_name=player.display_name,
+                is_disqualified=player.is_disqualified,
+            )
+        )
+
+    return jsonify(SuccessResult(status=True, data={"players": player_details}))
+
+
+@app.route("/api/organizer/player/<player_id>/disqualified", methods=["POST"])
+def player_disqualified_handler(player_id: str):
+    """
+    テナント管理者向けAPI
+    参加者を失格にする
+    """
+    viewer = parse_viewer()
+    if viewer.role != ROLE_ORGANIZER:
+        abort(403, "role organizer required")
+
+    tenant_db = connect_to_tenant_db(viewer.tenant_id)
+
+    now = int(datetime.now().timestamp())
+
+    tenant_db.execute(
+        "UPDATE player SET is_disqualified = ?, updated_at = ? WHERE id = ?",
+        True,
+        now,
+        player_id,
+    )
+
+    player = retrieve_player(tenant_db, player_id)
+    if not player:
+        abort(404, "player not found")
+
+    return jsonify(
+        SuccessResult(
+            status=True,
+            data={
+                "player": PlayerDetail(
+                    id=player.id, display_name=player.display_name, is_disqualified=player.is_disqualified
+                )
+            },
+        )
+    )
+
+
+@dataclass
+class CompetitionDetail:
+    id: str
+    title: str
+    is_finished: bool
+
+
+@app.route("/api/organizer/competitions/add", methods=["POST"])
+def competitions_add_handler():
+    """
+    テナント管理者向けAPI
+    大会を追加する
+    """
+    viewer = parse_viewer()
+    if viewer.role != ROLE_ORGANIZER:
+        abort(403, "role organizer required")
+
+    tenant_db = connect_to_tenant_db(viewer.tenant_id)
+
+    title = request.values.get("title")
+
+    now = int(datetime.now().timestamp())
+    id = dispense_id()
+
+    tenant_db.execute(
+        "INSERT INTO competition (id, tenant_id, title, finished_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+        id,
+        viewer.tenant_id,
+        title,
+        None,
+        now,
+        now,
+    )
+
+    return jsonify(
+        SuccessResult(
+            status=True,
+            data={"competition": CompetitionDetail(id=id, title=title, is_finished=False)},
+        )
+    )
+
+
+@app.route("/api/organizer/competition/<competition_id>/finish", methods=["POST"])
+def competition_finish_handler(competition_id: str):
+    """
+    テナント管理者向けAPI
+    大会を終了する
+    """
+    viewer = parse_viewer()
+    if viewer.role != ROLE_ORGANIZER:
+        abort(403, "role organizer required")
+
+    tenant_db = connect_to_tenant_db(viewer.tenant_id)
+
+    competition = retrieve_competition(tenant_db, competition_id)
+    if not competition:
+        abort(404, "competition not found")
+
+    now = int(datetime.now().timestamp())
+
+    tenant_db.execute(
+        "UPDATE competition SET finished_at = ?, updated_at = ? WHERE id = ?",
+        now,
+        now,
+        competition_id,
+    )
+
+    return jsonify({"status": True})
+
+
+@app.route("/api/organizer/competition/<competition_id>/score", methods=["POST"])
+def competition_score_handler(competition_id: str):
+    """
+    テナント管理者向けAPI
+    大会のスコアをCSVでアップロードする
+    """
+    viewer = parse_viewer()
+    if viewer.role != ROLE_ORGANIZER:
+        abort(403, "role organizer required")
+
+    tenant_db = connect_to_tenant_db(viewer.tenant_id)
+
+    competition = retrieve_competition(tenant_db, competition_id)
+    if not competition:
+        abort(404, "competition not found")
+
+    if competition.finished_at:
+        abort(400, "competition is finished")
+
+    form_file = request.files.get("scores")
+    csv_reader = csv.reader(codecs.iterdecode(form_file, "utf-8"))
+    header = next(csv_reader)
+
+    if header != ["player_id", "score"]:
+        abort(400, "invalid CSV headers")
+
+    # DELETEしたタイミングで参照が来ると空っぽのランキングになるのでロックする
+    lock_file = flock_by_tenant_id(viewer.tenant_id)
+    if not lock_file:
+        raise RuntimeError("error flock_by_tenant_id")
+
+    try:
+        row_num = 0
+        player_score_rows = []
+        for row in csv_reader:
+            row_num += 1
+            if len(row) != 2:
+                continue
+            player_id = row[0]
+            score_str = row[1]
+            if retrieve_player(tenant_db, player_id) is None:
+                # 存在しない参加者が含まれている
+                abort(400, f"player not found: {player_id}")
+
+            score = int(score_str, 10)
+            id = dispense_id()
+            now = int(datetime.now().timestamp())
+            player_score_rows.append(
+                PlayerScoreRow(
+                    id=id,
+                    tenant_id=viewer.tenant_id,
+                    player_id=player_id,
+                    competition_id=competition_id,
+                    score=score,
+                    row_num=row_num,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+
+        tenant_db.execute(
+            "DELETE FROM player_score WHERE tenant_id = ? AND competition_id = ?",
+            viewer.tenant_id,
+            competition_id,
+        )
+
+        for player_score_row in player_score_rows:
+            tenant_db.execute(
+                "INSERT INTO player_score (id, tenant_id, player_id, competition_id, score, row_num, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                player_score_row.id,
+                player_score_row.tenant_id,
+                player_score_row.player_id,
+                player_score_row.competition_id,
+                player_score_row.score,
+                player_score_row.row_num,
+                player_score_row.created_at,
+                player_score_row.updated_at,
+            )
+    finally:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_file.close()
+
+    return jsonify(SuccessResult(status=True, data={"rows": len(player_score_rows)}))
+
+
+@app.route("/api/organizer/billing", methods=["GET"])
+def billing_handler():
+    """
+    テナント管理者向けAPI
+    テナント内の課金レポートを取得する
+    """
+    viewer = parse_viewer()
+    if viewer.role != ROLE_ORGANIZER:
+        abort(403, "role organizer required")
+
+    tenant_db = connect_to_tenant_db(viewer.tenant_id)
+
+    competition_rows = tenant_db.execute(
+        "SELECT * FROM competition WHERE tenant_id=? ORDER BY created_at DESC",
+        viewer.tenant_id,
+    ).fetchall()
+    if not competition_rows:
+        raise RuntimeError("error Select competition")
+
+    billing_reports = []
+    for competition_row in competition_rows:
+        report = billing_report_by_competition(tenant_db, viewer.tenant_id, competition_row.id)
+        billing_reports.append(report)
+
+    return jsonify(SuccessResult(status=True, data={"reports": billing_reports}))
+
+
+@app.route("/api/organizer/competitions", methods=["GET"])
+def organizer_competitions_handler():
+    """
+    テナント管理者向けAPI
+    大会の一覧を取得する
+    """
+    viewer = parse_viewer()
+    if viewer.role != ROLE_ORGANIZER:
+        abort(403, "role organizer required")
+
+    tenant_db = connect_to_tenant_db(viewer.tenant_id)
+
+    return competitions_handler(viewer, tenant_db)
+
+
+@dataclass
+class PlayerScoreDetail:
+    competition_title: str
+    score: int
+
+
+@app.route("/api/player/player/<player_id>", methods=["GET"])
+def player_handler(player_id: str):
+    """
+    参加者向けAPI
+    参加者の詳細情報を取得する
+    """
+    viewer = parse_viewer()
+    if viewer.role != ROLE_PLAYER:
+        abort(403, "role player required")
+
+    tenant_db = connect_to_tenant_db(viewer.tenant_id)
+
+    authorize_player(tenant_db, viewer.player_id)
+
+    player = retrieve_player(tenant_db, player_id)
+    if not player:
+        abort(404, "player not found")
+
+    competition_rows = tenant_db.execute("SELECT * FROM competition WHERE tenant_id = ? ORDER BY created_at ASC", viewer.tenant_id).fetchall()
+
+    # player_scoreを読んでいるときに更新が走ると不整合が起こるのでロックを取得する
+    lock_file = flock_by_tenant_id(viewer.tenant_id)
+    if not lock_file:
+        raise RuntimeError("error flock_by_tenant_id")
+
+    try:
+        player_score_rows = []
+        for competition_row in competition_rows:
+            # 最後にCSVに登場したスコアを採用する = row_numが一番大きいもの
+            player_score_row = tenant_db.execute(
+                "SELECT * FROM player_score WHERE tenant_id = ? AND competition_id = ? AND player_id = ? ORDER BY row_num DESC LIMIT 1",
+                viewer.tenant_id,
+                competition_row.id,
+                player.id,
+            ).fetchone()
+            if not player_score_row:
+                # 行がない = スコアが記録されてない
+                continue
+            player_score_rows.append(PlayerScoreRow(**player_score_row))
+
+        player_score_details = []
+        for player_score_row in player_score_rows:
+            competition = retrieve_competition(tenant_db, player_score_row.competition_id)
+            if not competition:
+                continue
+            player_score_details.append(
+                PlayerScoreDetail(competition_title=competition.title, score=player_score_row.score)
+            )
+    finally:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_file.close()
+
+    return jsonify(
+        SuccessResult(
+            status=True,
+            data={
+                "player": PlayerDetail(
+                    id=player.id, display_name=player.display_name, is_disqualified=player.is_disqualified
+                ),
+                "scores": player_score_details,
+            },
+        )
+    )
+
+
+@dataclass
+class CompetitionRank:
+    rank: int
+    score: int
+    player_id: str
+    player_display_name: str
+    row_num: int
+
+
+@app.route("/api/player/competition/<competition_id>/ranking", methods=["GET"])
+def competition_ranking_handler(competition_id):
+    """
+    参加者向けAPI
+    大会ごとのランキングを取得する
+    """
+    viewer = parse_viewer()
+    if viewer.role != ROLE_PLAYER:
+        abort(403, "role player required")
+
+    tenant_db = connect_to_tenant_db(viewer.tenant_id)
+
+    authorize_player(tenant_db, viewer.player_id)
+
+    # 大会の存在確認
+    competition = retrieve_competition(tenant_db, competition_id)
+    if not competition:
+        abort(404, "competition not found")
+
+    now = int(datetime.now().timestamp())
+    tenant_row = admin_db.execute("SELECT * FROM tenant WHERE id = %s", viewer.tenant_id).fetchone()
+    if not tenant_row:
+        raise RuntimeError(f"Error Select tenant: id={viewer.tenant_id}")
+
+    admin_db.execute(
+        "INSERT INTO visit_history (player_id, tenant_id, competition_id, created_at, updated_at) VALUES (%s, %s, %s, %s, %s)",
+        viewer.player_id,
+        tenant_row.id,
+        competition_id,
+        now,
+        now,
+    )
+
+    rank_after = 0
+    rank_after_str = request.args.get("rank_after")
+    if rank_after_str:
+        rank_after = int(rank_after_str)
+
+    # player_scoreを読んでいるときに更新が走ると不整合が起こるのでロックを取得する
+    lock_file = flock_by_tenant_id(viewer.tenant_id)
+    if not lock_file:
+        raise RuntimeError("error flock_by_tenant_id")
+
+    try:
+        player_score_rows = tenant_db.execute(
+            "SELECT * FROM player_score WHERE tenant_id = ? AND competition_id = ? ORDER BY row_num DESC",
+            tenant_row.id,
+            competition_id,
+        ).fetchall()
+
+        ranks = []
+        scored_player_set = {}
+        for player_score_row in player_score_rows:
+            # player_scoreが同一player_id内ではrow_numの降順でソートされているので
+            # 現れたのが2回目以降のplayer_idはより大きいrow_numでスコアが出ているとみなせる
+            if scored_player_set.get(player_score_row.player_id) is not None:
+                continue
+
+            scored_player_set[player_score_row.player_id] = {}
+            player = retrieve_player(tenant_db, player_score_row.player_id)
+            if not player:
+                raise RuntimeError("error retrievePlayer")
+            ranks.append(
+                CompetitionRank(
+                    rank=0,
+                    score=player_score_row.score,
+                    player_id=player.id,
+                    player_display_name=player.display_name,
+                    row_num=player_score_row.row_num,
+                )
+            )
+
+        ranks.sort(key=lambda rank: rank.row_num)
+        ranks.sort(key=lambda rank: rank.score, reverse=True)
+
+        paged_ranks = []
+        for i, rank in enumerate(ranks):
+            if i < rank_after:
+                continue
+            paged_ranks.append(
+                CompetitionRank(
+                    rank=i + 1,
+                    score=rank.score,
+                    player_id=rank.player_id,
+                    player_display_name=rank.player_display_name,
+                    row_num=0,
+                )
+            )
+            if len(paged_ranks) >= 100:
+                break
+    finally:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_file.close()
+
+    return jsonify(
+        SuccessResult(
+            status=True,
+            data={
+                "competition": CompetitionDetail(
+                    id=competition.id, title=competition.title, is_finished=bool(competition.finished_at)
+                ),
+                "ranks": paged_ranks,
+            },
+        )
+    )
+
+
+@app.route("/api/player/competitions", methods=["GET"])
+def player_competitions_handler():
+    """
+    参加者向けAPI
+    大会の一覧を取得する
+    """
+    viewer = parse_viewer()
+    if viewer.role != ROLE_PLAYER:
+        abort(403, "role player required")
+
+    tenant_db = connect_to_tenant_db(viewer.tenant_id)
+
+    authorize_player(tenant_db, viewer.player_id)
+
+    return competitions_handler(viewer, tenant_db)
+
+
+def competitions_handler(viewer: Viewer, tenant_db):
+    competition_rows = tenant_db.execute(
+        "SELECT * FROM competition WHERE tenant_id=? ORDER BY created_at DESC", (viewer.tenant_id)
+    ).fetchall()
+
+    competition_details = []
+    for competition_row in competition_rows:
+        competition_details.append(
+            CompetitionDetail(
+                id=competition_row.id,
+                title=competition_row.title,
+                is_finished=bool(competition_row.finished_at),
+            )
+        )
+
+    return jsonify(SuccessResult(status=True, data={"competitions": competition_details}))
+
+
+@dataclass
+class TenantDetail:
+    name: str
+    display_name: str
+
+
+@app.route("/api/me", methods=["GET"])
+def me_handler():
+    """
+    共通API
+    JWTで認証した結果、テナントやユーザ情報を返す
+    """
+    tenant = retrieve_tenant_row_from_header()
+    tenant_detail = TenantDetail(name=tenant.name, display_name=tenant.display_name)
+
+    viewer = parse_viewer()
+    if viewer.role == ROLE_ADMIN or viewer.role == ROLE_ORGANIZER:
+        return jsonify(
+            SuccessResult(
+                status=True,
+                data={
+                    "tenant": tenant_detail,
+                    "me": None,
+                    "role": viewer.role,
+                    "logged_in": True,
+                },
+            )
+        )
+
+    tenant_db = connect_to_tenant_db(viewer.tenant_id)
+    player = retrieve_player(tenant_db, viewer.player_id)
+    if not player:
+        jsonify(
+            SuccessResult(
+                status=True,
+                data={
+                    "tenant": tenant_detail,
+                    "me": None,
+                    "role": ROLE_NONE,
+                    "logged_in": False,
+                },
+            )
+        )
+
+    return jsonify(
+        SuccessResult(
+            status=True,
+            data={
+                "tenant": tenant_detail,
+                "me": PlayerDetail(
+                    id=player.id, display_name=player.display_name, is_disqualified=player.is_disqualified
+                ),
+                "role": viewer.role,
+                "logged_in": True,
+            },
+        )
+    )
 
 
 @app.route("/initialize", methods=["POST"])
-def post_initialize():
-    """サービスを初期化"""
-    if "jia_service_url" not in request.json:
-        raise BadRequest("bad request body")
-
-    call("../sql/init.sh")
-
-    cnx = cnxpool.connect()
+def initialize_handler():
+    """
+    ベンチマーカー向けAPI
+    ベンチマーカーが起動したときに最初に呼ぶ
+    データベースの初期化などが実行されるため、スキーマを変更した場合などは適宜改変すること
+    """
     try:
-        cur = cnx.cursor()
-        query = "INSERT INTO `isu_association_config` (`name`, `url`) VALUES (%s, %s) ON DUPLICATE KEY UPDATE `url` = VALUES(`url`)"
-        cur.execute(query, ("jia_service_url", request.json["jia_service_url"]))
-        cnx.commit()
-    finally:
-        cnx.close()
-
-    return {"language": "python"}
-
-
-@app.route("/api/auth", methods=["POST"])
-def post_auth():
-    """サインアップ・サインイン"""
-    req_authorization_header = request.headers.get("Authorization")
-    if req_authorization_header is None:
-        raise Forbidden("forbidden")
-
-    try:
-        req_jwt = req_authorization_header.removeprefix("Bearer ")
-        req_jwt_header = jwt.get_unverified_header(req_jwt)
-        req_jwt_payload = jwt.decode(req_jwt, jwt_public_key, algorithms=[req_jwt_header["alg"]])
-    except jwt.exceptions.PyJWTError:
-        raise Forbidden("forbidden")
-
-    jia_user_id = req_jwt_payload.get("jia_user_id")
-    if type(jia_user_id) is not str:
-        raise BadRequest("invalid JWT payload")
-
-    cnx = cnxpool.connect()
-    try:
-        cur = cnx.cursor()
-        query = "INSERT IGNORE INTO user (`jia_user_id`) VALUES (%s)"
-        cur.execute(query, (jia_user_id,))
-        cnx.commit()
-    finally:
-        cnx.close()
-
-    session["jia_user_id"] = jia_user_id
-
-    return ""
-
-
-@app.route("/api/signout", methods=["POST"])
-def post_signout():
-    """サインアウト"""
-    get_user_id_from_session()
-    session.clear()
-    return ""
-
-
-@app.route("/api/user/me", methods=["GET"])
-def get_me():
-    """サインインしている自分自身の情報を取得"""
-    jia_user_id = get_user_id_from_session()
-    return {"jia_user_id": jia_user_id}
-
-
-@app.route("/api/isu", methods=["GET"])
-def get_isu_list():
-    """ISUの一覧を取得"""
-    jia_user_id = get_user_id_from_session()
-
-    query = "SELECT * FROM `isu` WHERE `jia_user_id` = %s ORDER BY `id` DESC"
-    isu_list = [Isu(**row) for row in select_all(query, (jia_user_id,))]
-
-    response_list = []
-    for isu in isu_list:
-        found_last_condition = True
-        query = "SELECT * FROM `isu_condition` WHERE `jia_isu_uuid` = %s ORDER BY `timestamp` DESC LIMIT 1"
-        row = select_row(query, (isu.jia_isu_uuid,))
-        if row is None:
-            found_last_condition = False
-        last_condition = IsuCondition(**row) if found_last_condition else None
-
-        formatted_condition = None
-        if found_last_condition:
-            formatted_condition = GetIsuConditionResponse(
-                jia_isu_uuid=last_condition.jia_isu_uuid,
-                isu_name=isu.name,
-                timestamp=int(last_condition.timestamp.timestamp()),
-                is_sitting=last_condition.is_sitting,
-                condition=last_condition.condition,
-                condition_level=calculate_condition_level(last_condition.condition),
-                message=last_condition.message,
-            )
-
-        response_list.append(
-            GetIsuListResponse(
-                id=isu.id,
-                jia_isu_uuid=isu.jia_isu_uuid,
-                name=isu.name,
-                character=isu.character,
-                latest_isu_condition=formatted_condition,
-            )
-        )
-
-    return jsonify(response_list)
-
-
-@app.route("/api/isu", methods=["POST"])
-def post_isu():
-    """ISUを登録"""
-    jia_user_id = get_user_id_from_session()
-
-    use_default_image = False
-
-    jia_isu_uuid = request.form.get("jia_isu_uuid")
-    isu_name = request.form.get("isu_name")
-    image = request.files.get("image")
-
-    if image is None:
-        use_default_image = True
-
-    if use_default_image:
-        with open(DEFAULT_ICON_FILE_PATH, "rb") as f:
-            image = f.read()
-    else:
-        image = image.read()
-
-    cnx = cnxpool.connect()
-    try:
-        cnx.start_transaction()
-        cur = cnx.cursor(dictionary=True)
-
-        try:
-            query = """
-                INSERT
-                INTO `isu` (`jia_isu_uuid`, `name`, `image`, `jia_user_id`)
-                VALUES (%s, %s, %s, %s)
-                """
-            cur.execute(query, (jia_isu_uuid, isu_name, image, jia_user_id))
-        except mysql.connector.errors.IntegrityError as e:
-            if e.errno == MYSQL_ERR_NUM_DUPLICATE_ENTRY:
-                abort(409, "duplicated: isu")
-            raise
-
-        target_url = f"{get_jia_service_url()}/api/activate"
-        body = {
-            "target_base_url": post_isu_condition_target_base_url,
-            "isu_uuid": jia_isu_uuid,
-        }
-        headers = {
-            "Content-Type": "application/json",
-        }
-        req_jia = urllib.request.Request(target_url, json.dumps(body).encode(), headers)
-        try:
-            with urllib.request.urlopen(req_jia) as res:
-                isu_from_jia = json.load(res)
-        except urllib.error.HTTPError as e:
-            app.logger.error(f"JIAService returned error: status code {e.code}, message: {e.reason}")
-            abort(e.code, "JIAService returned error")
-        except urllib.error.URLError as e:
-            app.logger.error(f"failed to request to JIAService: {e.reason}")
-            raise InternalServerError
-
-        query = "UPDATE `isu` SET `character` = %s WHERE  `jia_isu_uuid` = %s"
-        cur.execute(query, (isu_from_jia["character"], jia_isu_uuid))
-
-        query = "SELECT * FROM `isu` WHERE `jia_user_id` = %s AND `jia_isu_uuid` = %s"
-        cur.execute(query, (jia_user_id, jia_isu_uuid))
-        isu = Isu(**cur.fetchone())
-
-        cnx.commit()
-    except:
-        cnx.rollback()
-        raise
-    finally:
-        cnx.close()
-
-    return jsonify(isu), 201
-
-
-@app.route("/api/isu/<jia_isu_uuid>", methods=["GET"])
-def get_isu_id(jia_isu_uuid):
-    """ISUの情報を取得"""
-    jia_user_id = get_user_id_from_session()
-
-    query = "SELECT * FROM `isu` WHERE `jia_user_id` = %s AND `jia_isu_uuid` = %s"
-    res = select_row(query, (jia_user_id, jia_isu_uuid))
-    if res is None:
-        raise NotFound("not found: isu")
-
-    return jsonify(Isu(**res))
-
-
-@app.route("/api/isu/<jia_isu_uuid>/icon", methods=["GET"])
-def get_isu_icon(jia_isu_uuid):
-    """ISUのアイコンを取得"""
-    jia_user_id = get_user_id_from_session()
-
-    query = "SELECT `image` FROM `isu` WHERE `jia_user_id` = %s AND `jia_isu_uuid` = %s"
-    res = select_row(query, (jia_user_id, jia_isu_uuid))
-    if res is None:
-        raise NotFound("not found: isu")
-
-    return make_response(res["image"], 200, {"Content-Type": "image/jpeg"})
-
-
-@app.route("/api/isu/<jia_isu_uuid>/graph", methods=["GET"])
-def get_isu_graph(jia_isu_uuid):
-    """ISUのコンディショングラフ描画のための情報を取得"""
-    jia_user_id = get_user_id_from_session()
-
-    dt = request.args.get("datetime")
-    if dt is None:
-        raise BadRequest("missing: datetime")
-    try:
-        dt = datetime.fromtimestamp(int(dt), tz=TZ)
-    except:
-        raise BadRequest("bad format: datetime")
-    dt = truncate_datetime(dt, timedelta(hours=1))
-
-    query = "SELECT COUNT(*) FROM `isu` WHERE `jia_user_id` = %s AND `jia_isu_uuid` = %s"
-    (count,) = select_row(query, (jia_user_id, jia_isu_uuid), dictionary=False)
-    if count == 0:
-        raise NotFound("not found: isu")
-
-    res = generate_isu_graph_response(jia_isu_uuid, dt)
-    return jsonify(res)
-
-
-def truncate_datetime(dt: datetime, duration: timedelta) -> datetime:
-    """datetime 値の指定した粒度で切り捨てる"""
-    if duration == timedelta(hours=1):
-        return datetime(dt.year, dt.month, dt.day, dt.hour, tzinfo=dt.tzinfo)
-    raise Exception("unsupported duration")
-
-
-def generate_isu_graph_response(jia_isu_uuid: str, graph_date: datetime) -> list[GraphResponse]:
-    """グラフのデータ点を一日分生成"""
-    data_points = []
-    conditions_in_this_hour = []
-    timestamps_in_this_hour = []
-    start_time_in_this_hour = None
-
-    query = "SELECT * FROM `isu_condition` WHERE `jia_isu_uuid` = %s ORDER BY `timestamp` ASC"
-    rows = select_all(query, (jia_isu_uuid,))
-    for row in rows:
-        condition = IsuCondition(**row)
-        truncated_condition_time = truncate_datetime(condition.timestamp, timedelta(hours=1))
-        if truncated_condition_time != start_time_in_this_hour:
-            if len(conditions_in_this_hour) > 0:
-                data_points.append(
-                    GraphDataPointWithInfo(
-                        jia_isu_uuid=jia_isu_uuid,
-                        start_at=start_time_in_this_hour,
-                        data=calculate_graph_data_point(conditions_in_this_hour),
-                        condition_timestamps=timestamps_in_this_hour,
-                    )
-                )
-            start_time_in_this_hour = truncated_condition_time
-            conditions_in_this_hour = []
-            timestamps_in_this_hour = []
-        conditions_in_this_hour.append(condition)
-        timestamps_in_this_hour.append(int(condition.timestamp.timestamp()))
-
-    if len(conditions_in_this_hour) > 0:
-        data_points.append(
-            GraphDataPointWithInfo(
-                jia_isu_uuid=jia_isu_uuid,
-                start_at=start_time_in_this_hour,
-                data=calculate_graph_data_point(conditions_in_this_hour),
-                condition_timestamps=timestamps_in_this_hour,
-            )
-        )
-
-    end_time = graph_date + timedelta(days=1)
-    start_index = len(data_points)
-    end_next_index = len(data_points)
-    for i, graph in enumerate(data_points):
-        if start_index == len(data_points) and graph.start_at >= graph_date:
-            start_index = i
-        if end_next_index == len(data_points) and graph.start_at > end_time:
-            end_next_index = i
-
-    filtered_data_points = []
-    if start_index < end_next_index:
-        filtered_data_points = data_points[start_index:end_next_index]
-
-    response_list = []
-    index = 0
-    this_time = graph_date
-
-    while this_time < graph_date + timedelta(days=1):
-        data = None
-        timestamps = []
-
-        if index < len(filtered_data_points):
-            data_with_info = filtered_data_points[index]
-
-            if data_with_info.start_at == this_time:
-                data = data_with_info.data
-                timestamps = data_with_info.condition_timestamps
-                index += 1
-
-        response_list.append(
-            GraphResponse(
-                start_at=int(this_time.timestamp()),
-                end_at=int((this_time + timedelta(hours=1)).timestamp()),
-                data=data,
-                condition_timestamps=timestamps,
-            )
-        )
-
-        this_time += timedelta(hours=1)
-
-    return response_list
-
-
-def calculate_graph_data_point(isu_conditions: list[IsuCondition]) -> GraphDataPoint:
-    """複数のISUのコンディションからグラフの一つのデータ点を計算"""
-    conditions_count = {"is_broken": 0, "is_dirty": 0, "is_overweight": 0}
-    raw_score = 0
-    for condition in isu_conditions:
-        bad_conditions_count = 0
-
-        if not is_valid_condition_format(condition.condition):
-            raise Exception("invalid condition format")
-
-        for cond_str in condition.condition.split(","):
-            key_value = cond_str.split("=")
-
-            condition_name = key_value[0]
-            if key_value[1] == "true":
-                conditions_count[condition_name] += 1
-                bad_conditions_count += 1
-
-        if bad_conditions_count >= 3:
-            raw_score += SCORE_CONDITION_LEVEL.CRITICAL
-        elif bad_conditions_count >= 1:
-            raw_score += SCORE_CONDITION_LEVEL.WARNING
-        else:
-            raw_score += SCORE_CONDITION_LEVEL.INFO
-
-    sitting_count = 0
-    for condition in isu_conditions:
-        if condition.is_sitting:
-            sitting_count += 1
-
-    isu_conditions_length = len(isu_conditions)
-
-    return GraphDataPoint(
-        score=int(raw_score * 100 / 3 / isu_conditions_length),
-        percentage=ConditionsPercentage(
-            sitting=int(sitting_count * 100 / isu_conditions_length),
-            is_broken=int(conditions_count["is_broken"] * 100 / isu_conditions_length),
-            is_overweight=int(conditions_count["is_overweight"] * 100 / isu_conditions_length),
-            is_dirty=int(conditions_count["is_dirty"] * 100 / isu_conditions_length),
-        ),
-    )
-
-
-@app.route("/api/condition/<jia_isu_uuid>", methods=["GET"])
-def get_isu_confitions(jia_isu_uuid):
-    """ISUのコンディションを取得"""
-    jia_user_id = get_user_id_from_session()
-
-    try:
-        end_time = datetime.fromtimestamp(int(request.args.get("end_time")), tz=TZ)
-    except:
-        raise BadRequest("bad format: end_time")
-
-    condition_level_csv = request.args.get("condition_level")
-    if condition_level_csv is None:
-        raise BadRequest("missing: condition_level")
-    condition_level = set(condition_level_csv.split(","))
-
-    start_time_str = request.args.get("start_time")
-    start_time = None
-    if start_time_str is not None:
-        try:
-            start_time = datetime.fromtimestamp(int(start_time_str), tz=TZ)
-        except:
-            raise BadRequest("bad format: start_time")
-
-    query = "SELECT name FROM `isu` WHERE `jia_isu_uuid` = %s AND `jia_user_id` = %s"
-    row = select_row(query, (jia_isu_uuid, jia_user_id))
-    if row is None:
-        raise NotFound("not found: isu")
-    isu_name = row["name"]
-
-    condition_response = get_isu_conditions_from_db(
-        jia_isu_uuid,
-        end_time,
-        condition_level,
-        start_time,
-        CONDITION_LIMIT,
-        isu_name,
-    )
-
-    return jsonify(condition_response)
-
-
-def get_isu_conditions_from_db(
-    jia_isu_uuid: str,
-    end_time: datetime,
-    condition_level: set,
-    start_time: datetime,
-    limit: int,
-    isu_name: str,
-) -> list[GetIsuConditionResponse]:
-    """ISUのコンディションをDBから取得"""
-    if start_time is None:
-        query = """
-            SELECT *
-            FROM `isu_condition`
-            WHERE `jia_isu_uuid` = %s AND `timestamp` < %s
-            ORDER BY `timestamp` DESC
-            """
-        conditions = [IsuCondition(**row) for row in select_all(query, (jia_isu_uuid, end_time))]
-    else:
-        query = """
-            SELECT *
-            FROM `isu_condition`
-            WHERE `jia_isu_uuid` = %s AND `timestamp` < %s AND %s <= `timestamp`
-            ORDER BY `timestamp` DESC
-            """
-        conditions = [IsuCondition(**row) for row in select_all(query, (jia_isu_uuid, end_time, start_time))]
-
-    condition_response = []
-    for c in conditions:
-        try:
-            c_level = calculate_condition_level(c.condition)
-        except:
-            continue
-
-        if c_level.value in condition_level:
-            condition_response.append(
-                GetIsuConditionResponse(
-                    jia_isu_uuid=jia_isu_uuid,
-                    isu_name=isu_name,
-                    timestamp=int(c.timestamp.timestamp()),
-                    is_sitting=c.is_sitting,
-                    condition=c.condition,
-                    condition_level=c_level,
-                    message=c.message,
-                )
-            )
-
-    if len(condition_response) > limit:
-        condition_response = condition_response[:limit]
-
-    return condition_response
-
-
-@app.route("/api/trend", methods=["GET"])
-def get_trend():
-    """ISUの性格毎の最新のコンディション情報"""
-    query = "SELECT `character` FROM `isu` GROUP BY `character`"
-    character_list = [row["character"] for row in select_all(query)]
-
-    res = []
-
-    for character in character_list:
-        query = "SELECT * FROM `isu` WHERE `character` = %s"
-        isu_list = [Isu(**row) for row in select_all(query, (character,))]
-
-        character_info_isu_conditions = []
-        character_warning_isu_conditions = []
-        character_critical_isu_conditions = []
-        for isu in isu_list:
-            query = "SELECT * FROM `isu_condition` WHERE `jia_isu_uuid` = %s ORDER BY timestamp DESC"
-            conditions = [IsuCondition(**row) for row in select_all(query, (isu.jia_isu_uuid,))]
-
-            if len(conditions) > 0:
-                isu_last_condition = conditions[0]
-                condition_level = calculate_condition_level(isu_last_condition.condition)
-
-                trend_condition = TrendCondition(isu_id=isu.id, timestamp=int(isu_last_condition.timestamp.timestamp()))
-
-                if condition_level == "info":
-                    character_info_isu_conditions.append(trend_condition)
-                elif condition_level == "warning":
-                    character_warning_isu_conditions.append(trend_condition)
-                elif condition_level == "critical":
-                    character_critical_isu_conditions.append(trend_condition)
-
-        character_info_isu_conditions.sort(key=lambda c: c.timestamp, reverse=True)
-        character_warning_isu_conditions.sort(key=lambda c: c.timestamp, reverse=True)
-        character_critical_isu_conditions.sort(key=lambda c: c.timestamp, reverse=True)
-
-        res.append(
-            TrendResponse(
-                character=character,
-                info=character_info_isu_conditions,
-                warning=character_warning_isu_conditions,
-                critical=character_critical_isu_conditions,
-            )
-        )
-
-    return jsonify(res)
-
-
-@app.route("/api/condition/<jia_isu_uuid>", methods=["POST"])
-def post_isu_condition(jia_isu_uuid):
-    """ISUからのコンディションを受け取る"""
-    # TODO: 一定割合リクエストを落としてしのぐようにしたが、本来は全量さばけるようにすべき
-    drop_probability = 0.9
-    if random() <= drop_probability:
-        app.logger.warning("drop post isu condition request")
-        return "", 202
-    try:
-        req = [PostIsuConditionRequest(**row) for row in request.json]
-    except:
-        raise BadRequest("bad request body")
-
-    cnx = cnxpool.connect()
-    try:
-        cnx.start_transaction()
-        cur = cnx.cursor(dictionary=True)
-
-        query = "SELECT COUNT(*) AS cnt FROM `isu` WHERE `jia_isu_uuid` = %s"
-        cur.execute(query, (jia_isu_uuid,))
-        count = cur.fetchone()["cnt"]
-        if count == 0:
-            raise NotFound("not found: isu")
-
-        for cond in req:
-            if not is_valid_condition_format(cond.condition):
-                raise BadRequest("bad request body")
-
-            query = """
-                INSERT
-                INTO `isu_condition` (`jia_isu_uuid`, `timestamp`, `is_sitting`, `condition`, `message`)
-                VALUES (%s, %s, %s, %s, %s)
-                """
-            cur.execute(
-                query,
-                (
-                    jia_isu_uuid,
-                    datetime.fromtimestamp(cond.timestamp, tz=TZ),
-                    cond.is_sitting,
-                    cond.condition,
-                    cond.message,
-                ),
-            )
-
-        cnx.commit()
-    except:
-        cnx.rollback()
-        raise
-    finally:
-        cnx.close()
-
-    return "", 202
-
-
-def get_index(**kwargs):
-    return send_file(f"{FRONTEND_CONTENTS_PATH}/index.html")
-
-
-app.add_url_rule("/", view_func=get_index)
-app.add_url_rule("/isu/<jia_isu_uuid>", view_func=get_index)
-app.add_url_rule("/isu/<jia_isu_uuid>/condition", view_func=get_index)
-app.add_url_rule("/isu/<jia_isu_uuid>/graph", view_func=get_index)
-app.add_url_rule("/register", view_func=get_index)
-
-
-def calculate_condition_level(condition: str) -> CONDITION_LEVEL:
-    """ISUのコンディションの文字列からコンディションレベルを計算"""
-    warn_count = condition.count("=true")
-
-    if warn_count == 0:
-        condition_level = CONDITION_LEVEL.INFO
-    elif warn_count in (1, 2):
-        condition_level = CONDITION_LEVEL.WARNING
-    elif warn_count == 3:
-        condition_level = CONDITION_LEVEL.CRITICAL
-    else:
-        raise Exception("unexpected warn count")
-
-    return condition_level
-
-
-def is_valid_condition_format(condition_str: str) -> bool:
-    """ISUのコンディションの文字列がcsv形式になっているか検証"""
-    keys = ["is_dirty=", "is_overweight=", "is_broken="]
-    value_true = "true"
-    value_false = "false"
-
-    idx_cond_str = 0
-    for idx_keys, key in enumerate(keys):
-        if not condition_str[idx_cond_str:].startswith(key):
-            return False
-        idx_cond_str += len(key)
-
-        if condition_str[idx_cond_str:].startswith(value_true):
-            idx_cond_str += len(value_true)
-        elif condition_str[idx_cond_str:].startswith(value_false):
-            idx_cond_str += len(value_false)
-        else:
-            return False
-
-        if idx_keys < (len(keys) - 1):
-            if condition_str[idx_cond_str] != ",":
-                return False
-            idx_cond_str += 1
-
-    return idx_cond_str == len(condition_str)
+        subprocess.run([INITIALIZE_SCRIPT], shell=True)
+    except subprocess.CalledProcessError as e:
+        return f"error subprocess.run: {e.output} {e.stderr}"
+
+    return jsonify(SuccessResult(status=True, data={"lang": "python"}))
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=getenv("SERVER_APP_PORT", 3000), threaded=True)
+    run()

@@ -1,0 +1,1 @@
+subjectAltName=DNS.1:*.t.isucon.local, DNS.2:*.t.isucon.dev

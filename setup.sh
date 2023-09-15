@@ -7,7 +7,7 @@ echo    # (optional) move to a new line
 if [[ ! $REPLY =~ ^[Yy]$ ]]
 then
   printf "See you later!\n"
-  exit 0
+exit 0
 fi
 
 # Pull application code & nginx, mysql config file

@@ -13,23 +13,27 @@ return function (ContainerBuilder $containerBuilder) {
     $containerBuilder->addDefinitions([
         SettingsInterface::class => function () {
             return new Settings([
-                'displayErrorDetails' => false, // Should be set to false in production
+                'displayErrorDetails' => true, // Should be set to false in production
                 'logError'            => true,
                 'logErrorDetails'     => true,
                 'logger' => [
-                    'name' => 'slim-app',
+                    'name' => 'isuports',
                     'path' => 'php://stdout',
                     'level' => Logger::DEBUG,
                 ],
                 'database' => [
-                    'host' => getenv('MYSQL_HOST') ?: '127.0.0.1',
-                    'port' => getenv('MYSQL_PORT') ?: '3306',
-                    'database' => getenv('MYSQL_DBNAME') ?: 'isucondition',
-                    'user' => getenv('MYSQL_USER') ?: 'isucon',
-                    'password' => getenv('MYSQL_PASS') ?: 'isucon',
+                    'host' => getenv('ISUCON_DB_HOST') ?: '127.0.0.1',
+                    'port' => getenv('ISUCON_DB_PORT') ?: '3306',
+                    'database' => getenv('ISUCON_DB_NAME') ?: 'isuports',
+                    'user' => getenv('ISUCON_DB_USER') ?: 'isucon',
+                    'password' => getenv('ISUCON_DB_PASSWORD') ?: 'isucon',
                 ],
-                'session' => [
-                    'name' => getenv('SESSION_KEY') ?: 'isucondition_php',
+                // sqliteのクエリログを出力する設定
+                // 環境変数 ISUCON_SQLITE_TRACE_FILE を設定すると、そのファイルにクエリログをJSON形式で出力する
+                // 未設定なら出力しない
+                'sqliteTrace' => [
+                    'name' => 'sqlite-trace',
+                    'path' => getenv('ISUCON_SQLITE_TRACE_FILE') ?: '',
                 ],
             ]);
         }
