@@ -25,15 +25,15 @@ help:
 
 ## Restart server
 restart: app/restart mysql/restart nginx/restart mysql/rotate-log nginx/rotate-log
-	@printf "${COLOR_GREEN}Success!${COLOR_DEFAULT}\n"
+	@printf "${COLOR_GREEN}Success!!!${COLOR_DEFAULT}\n"
 
 # Install tool
 install: mysql/install-pt-query-digest nginx/install-alp
-	@printf "${COLOR_GREEN}Success!${COLOR_DEFAULT}\n"
+	@printf "${COLOR_GREEN}Success!!!${COLOR_DEFAULT}\n"
 
 # Analyze
 analyze: mysql/pt-query-digest mysql/mysqldumpslow nginx/alp
-	@printf "${COLOR_GREEN}Success!${COLOR_DEFAULT}\n"
+	@printf "${COLOR_GREEN}Success!!!${COLOR_DEFAULT}\n"
 
 ## [App] Restart server
 app/restart:
