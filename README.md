@@ -39,7 +39,8 @@ Host isucon
 リモートホストのアプリケーション、Nginx, MySQL 設定ファイルをプルしてくるセットアップシェルスクリプトを実行。
 
 ```sh
-$ sh ./setup.sh
+$ sh ./pull.sh
+$ sh ./install_tools.sh
 ```
 
 ### 4. Fix to restart application server
@@ -60,9 +61,19 @@ SSH_KEY=
 ### 1. Build
 
 ```
-$ make build
+$ make app/build
 ```
 
 ### 2. Push & Create PR
 
 ファイルの変更を Commit & Push し、PR を作成すると自動でデプロイされる
+
+## Analyze
+
+### 1. Comment on pull request or issue
+
+Pull Request か Issue で下記のコメントをすると、アクセスログ解析とスロークエリログ解析が開始し、結果が出力させる
+
+```
+/analyze
+```
