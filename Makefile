@@ -1,48 +1,16 @@
 SHELL:=/bin/bash -e -o pipefail
-COLOR_GREEN:=\u001b[32m
-COLOR_DEFAULT:=\u001b[30m
 
 MYSQL_SLOW_LOG_PATH:=/var/log/mysql/mysql-slow.log
 NGINX_ACCESS_LOG_PATH:=/var/log/nginx/access.log
 
-default: help
-
-## This help screen
-help:
-	@printf "Available targets:\n\n"
-	@awk '/^[a-zA-Z\-\_0-9%:\\]+/ { \
-		helpMessage = match(lastLine, /^## (.*)/); \
-		if (helpMessage) { \
-			helpCommand = $$1; \
-			helpMessage = substr(lastLine, RSTART + 3, RLENGTH); \
-			gsub("\\\\", "", helpCommand); \
-			gsub(":+$$", "", helpCommand); \
-			printf "  \x1b[32;01m%-35s\x1b[0m %s\n", helpCommand, helpMessage; \
-		} \
-	} \
-	{ lastLine = $$0 }' $(MAKEFILE_LIST) | sort -u
-	@printf "\n"
-
-## Restart server
-restart: app/restart mysql/restart nginx/restart mysql/rotate-log nginx/rotate-log
-	@printf "${COLOR_GREEN}Success!!!${COLOR_DEFAULT}\n"
-
-# Install tool
-install: mysql/install-pt-query-digest nginx/install-alp
-	@printf "${COLOR_GREEN}Success!!!${COLOR_DEFAULT}\n"
-
-# Analyze
-analyze: mysql/pt-query-digest mysql/mysqldumpslow nginx/alp
-	@printf "${COLOR_GREEN}Success!!!${COLOR_DEFAULT}\n"
-
 ## [App] Restart server
 app/restart:
 	systemctl daemon-reload
-	systemctl restart isuports.service
+	systemctl restart isucondition.go.service
 
 ## [App] Build
 app/build:
-	cd webapp/go && GOOS=linux GOARCH=amd64 go build -o isuports ./cmd/isuports
+	cd webapp/go && GOOS=linux GOARCH=amd64 go build -o isucondition
 
 ## [MySQL] Restart server
 mysql/restart:
@@ -90,9 +58,5 @@ nginx/install-alp:
 nginx/alp:
 	# パスパラメータの正規表現の例： -m "/posts/[0-9]+,/image/.*"
 	# 並び替え： --sort=sum --sort=avg
-	alp json --file ${NGINX_ACCESS_LOG_PATH} -r > alp_analysis.txt
+	alp json --sort=avg --file ${NGINX_ACCESS_LOG_PATH} -m "/api/isu/[a-z0-9-]+/graph,/api/condition/[a-z0-9-]+" -r > alp_analysis.txt
 
-## [Redis] Install Redis
-redis/install:
-	apt-get update
-	apt-get install -y redis

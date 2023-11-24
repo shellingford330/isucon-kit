@@ -17,20 +17,28 @@ jobs:
           name: id_rsa
           known_hosts: unnecessary
           config: |
-            Host isucon
-              HostName ${{ secrets.HOST_NAME }}
+            Host isuconapp
+              HostName ${{ secrets.APP_HOST_NAME }}
+              User root
+              Port 22
+              StrictHostKeyChecking no
+              IdentityFile ~/.ssh/id_rsa
+            Host isucondb
+              HostName ${{ secrets.DB_HOST_NAME }}
               User root
               Port 22
               StrictHostKeyChecking no
               IdentityFile ~/.ssh/id_rsa
       - name: Analyze
         run: |
-          ssh isucon 'make analyze'
+          ssh isucondb 'make mysql/pt-query-digest'
+          ssh isucondb 'make mysql/mysqldumpslow'
+          ssh isuconapp 'make nginx/alp'
       - name: Pull analysis result
         run: |
-          rsync -av isucon:~/pt_query_digest_analysis.txt ./
-          rsync -av isucon:~/mysqldumpslow_analysis.txt ./
-          rsync -av isucon:~/alp_analysis.txt ./
+          rsync -av isucondb:~/pt_query_digest_analysis.txt ./
+          rsync -av isucondb:~/mysqldumpslow_analysis.txt ./
+          rsync -av isuconapp:~/alp_analysis.txt ./
       - name: Create pt-query-digest comment on PR
         uses: shellingford330/pr-comment-action@v0.0.6
         with:

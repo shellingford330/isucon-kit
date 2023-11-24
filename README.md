@@ -24,10 +24,15 @@ $ sudo cp ~/.ssh/authorized_keys /root/.ssh/authorized_keys
 
 ### 2. Configure remote host
 
-`~/.ssh/config`にホスト`isucon`としてリモートホスト情報（root ユーザ）を登録。
+`~/.ssh/config`にホスト`isuconapp`と `isucondb` エイリアスを登録。
 
 ```
-Host isucon
+Host isuconapp
+  Hostname <ホストIP>
+  User root
+  Port 22
+  IdentityFile ~/.ssh/id_ed25519
+Host isucondb
   Hostname <ホストIP>
   User root
   Port 22
@@ -52,7 +57,8 @@ Makefile の app/restart と app/build の両方を修正する。
 GitHub Actions の Secrets に Hostname と SSH キーの秘密鍵をセットする
 
 ```
-HOST_NAME=
+APP_HOST_NAME=
+DB_HOST_NAME=
 SSH_KEY=
 ```
 
@@ -69,8 +75,6 @@ $ make app/build
 ファイルの変更を Commit & Push し、PR を作成すると自動でデプロイされる
 
 ## Analyze
-
-### 1. Comment on pull request or issue
 
 Pull Request か Issue で下記のコメントをすると、アクセスログ解析とスロークエリログ解析が開始し、結果が出力させる
 

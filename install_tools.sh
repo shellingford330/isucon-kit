@@ -2,6 +2,10 @@
 
 set -ue -o pipefail
 
-# Install analyzer log tool
-rsync -av ./Makefile isucon:~ 
-ssh isucon 'make install'
+# Install analyzer for application
+rsync -av ./Makefile isuconapp:~ 
+ssh isuconapp 'make nginx/install-alp'
+
+# Install analyzer for DB
+rsync -av ./Makefile isucondb:~ 
+ssh isucondb 'make mysql/install-pt-query-digest'

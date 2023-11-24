@@ -1,6 +1,8 @@
 name: CD
 on:
-  push: main
+  push:
+    branches:
+      - main
 
 jobs:
   deploy:
@@ -14,8 +16,14 @@ jobs:
           name: id_rsa
           known_hosts: unnecessary
           config: |
-            Host isucon
-              HostName ${{ secrets.HOST_NAME }}
+            Host isuconapp
+              HostName ${{ secrets.APP_HOST_NAME }}
+              User root
+              Port 22
+              StrictHostKeyChecking no
+              IdentityFile ~/.ssh/id_rsa
+            Host isucondb
+              HostName ${{ secrets.DB_HOST_NAME }}
               User root
               Port 22
               StrictHostKeyChecking no
